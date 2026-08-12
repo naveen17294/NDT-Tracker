@@ -535,6 +535,13 @@ async def post_init(application):
 
 def main():
     """Start NDT Bot."""
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is missing!")
         return
