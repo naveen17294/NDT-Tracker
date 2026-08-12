@@ -522,7 +522,7 @@ async def post_init(application):
     if port:
         from aiohttp import web
         async def dummy_health_check(request):
-            return web.Response(text="Neon Drop Tracker is running 24/7!")
+            return web.Response(text="NDT Tracker is running 24/7!")
         
         web_app = web.Application()
         web_app.router.add_get('/', dummy_health_check)

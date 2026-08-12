@@ -1,6 +1,6 @@
-# Neon Drop Tracker (NDT) - Memory & Feature Usage
+# NDT Tracker - Memory & Feature Usage
 
-This file serves as the system memory for the **Neon Drop Tracker** project. It outlines the core architecture, advanced features, and edge-case handling mechanisms developed to make the bot robust and reliable.
+This file serves as the system memory for the **NDT Tracker** project. It outlines the core architecture, advanced features, and edge-case handling mechanisms developed to make the bot robust and reliable.
 
 ## 🏗️ Architecture
 - **Dual-Client System:** Uses `telethon` (User API) to silently monitor other channels in the background, and `python-telegram-bot` (Bot API) to handle the UI and commands.

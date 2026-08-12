@@ -98,7 +98,7 @@ class Notifier:
         source_text = 'TEXT_PARSE' if match_source == 'text' else 'LINK_TRACE'
 
         # Build message
-        lines = ['⚡ <b>N E O N   D R O P</b> ⚡\n']
+        lines = ['⚡ <b>N D T   T R A C K E R</b> ⚡\n']
         lines.append(f'💠 <b>{product}</b>')
         
         # Raw Text (Original Transmission) right after product name
