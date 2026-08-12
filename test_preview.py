@@ -1,13 +1,14 @@
 import asyncio
+import os
 from dotenv import load_dotenv
 load_dotenv()
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetWebPagePreviewRequest
-from config import SESSION_STRING, API_ID, API_HASH
-from telethon.sessions import StringSession
+from config import API_ID, API_HASH, SESSION_PATH, PHONE_NUMBER
 
 async def main():
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    session_file = os.path.join(SESSION_PATH, f'{PHONE_NUMBER}.session')
+    client = TelegramClient(session_file, API_ID, API_HASH)
     await client.start()
     
     url = "https://amzn.to/4qi3DSS"

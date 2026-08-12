@@ -189,19 +189,29 @@ class ChannelMonitor:
             if urls:
                 # First, try asking Telegram's servers to generate a preview for us
                 from telethon.tl.functions.messages import GetWebPagePreviewRequest
-                from telethon.tl.types import MessageMediaWebPage, WebPage
+                from telethon.tl.types import MessageMediaWebPage, WebPage, WebPagePending
                 try:
-                    preview_media = await self.client(GetWebPagePreviewRequest(message=urls[0]))
-                    if isinstance(preview_media, MessageMediaWebPage) and isinstance(preview_media.webpage, WebPage):
-                        preview_title = getattr(preview_media.webpage, 'title', '') or ''
-                        preview_desc = getattr(preview_media.webpage, 'description', '') or ''
-                        combined_text = f"{preview_title}\n{preview_desc}"
-                        
-                        if combined_text.strip():
-                            match_result = self.matcher.match(combined_text, watchlist)
-                            if match_result:
-                                match_source = 'telegram_preview_api'
-                                product_name = preview_title[:100] if preview_title else combined_text[:100]
+                    for _ in range(3):
+                        preview_media = await self.client(GetWebPagePreviewRequest(message=urls[0]))
+                        if isinstance(preview_media, MessageMediaWebPage):
+                            if isinstance(preview_media.webpage, WebPage):
+                                preview_title = getattr(preview_media.webpage, 'title', '') or ''
+                                preview_desc = getattr(preview_media.webpage, 'description', '') or ''
+                                combined_text = f"{preview_title}\n{preview_desc}"
+                                
+                                if combined_text.strip():
+                                    match_result = self.matcher.match(combined_text, watchlist)
+                                    if match_result:
+                                        match_source = 'telegram_preview_api'
+                                        product_name = preview_title[:100] if preview_title else combined_text[:100]
+                                break  # Successfully got WebPage, stop retrying
+                            elif isinstance(preview_media.webpage, WebPagePending):
+                                # Telegram is generating the preview, wait a moment and try again
+                                await asyncio.sleep(1.5)
+                            else:
+                                break # WebPageEmpty or other, stop retrying
+                        else:
+                            break
                 except Exception as e:
                     logger.debug(f"Manual preview request failed: {e}")
 

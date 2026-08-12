@@ -511,15 +511,27 @@ async def post_init(application):
     
     try:
         monitor = ChannelMonitor(application.bot)
-        # Telethon needs to run in the background. We can create an asyncio task.
-        # But wait, ChannelMonitor.start() is interactive if not logged in.
-        # To avoid blocking the bot startup, we will just call it.
-        # If the user is running it locally, it will block here to ask for phone/code.
         await monitor.start()
-        # Telethon's run_until_disconnected() should NOT be called here because it blocks forever.
-        # The events are already registered and will fire in the background.
     except Exception as e:
         logger.error(f"Failed to start ChannelMonitor: {e}")
+
+    # ── Render.com Keep-Alive Web Server ──
+    # Render requires "Web Services" to bind to a port, or it shuts them down.
+    # We run a dummy web server in the background to satisfy Render's health checks.
+    port = os.getenv('PORT')
+    if port:
+        from aiohttp import web
+        async def dummy_health_check(request):
+            return web.Response(text="Neon Drop Tracker is running 24/7!")
+        
+        web_app = web.Application()
+        web_app.router.add_get('/', dummy_health_check)
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', int(port))
+        await site.start()
+        logger.info(f"🌐 Started dummy web server on port {port} for Render keep-alive.")
+
 
 def main():
     """Start NDT Bot."""
