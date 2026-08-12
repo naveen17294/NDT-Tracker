@@ -2,6 +2,7 @@ import logging
 import hashlib
 import time
 import os
+import re
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel
