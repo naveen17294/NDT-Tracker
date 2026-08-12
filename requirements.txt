@@ -1,0 +1,6 @@
+python-telegram-bot==21.0
+telethon
+aiosqlite
+aiohttp
+beautifulsoup4
+python-dotenv

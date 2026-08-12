@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# NDT Data & Sessions (Contains sensitive session keys & local DB)
+data/
+sessions/
+*.db
+*.session
+*.session-journal
+
+# Environment / Secret Files
+.env
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
