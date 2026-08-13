@@ -1,0 +1,63 @@
+# Render blueprint for NDT Tracker.
+#
+# Two things kept killing the previous deployment:
+#   1. The web server bound its port only AFTER Telethon finished logging in, so
+#      Render's port scan timed out and reaped the service. bot.py now binds first.
+#   2. Free web services are spun down after ~15 min without an inbound request.
+#      The bot self-pings RENDER_EXTERNAL_URL/health to stay awake.
+#
+# The disk below is what keeps your watchlist, tracked channels and Telethon session
+# alive across deploys — without it the container's filesystem is wiped every restart
+# and the bot comes back with an empty watchlist.
+
+services:
+  - type: web
+    name: ndt-tracker
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+
+    # Persistent storage — REQUIRED, see note above.
+    # Free instances do not support disks; on the free plan either accept that state
+    # resets on restart, or set SESSION_STRING so at least the Telegram login survives.
+    disk:
+      name: ndt-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DATA_PATH
+        value: /var/data/
+      - key: SESSION_PATH
+        value: /var/data/sessions/
+
+      # ── Secrets: set these in the Render dashboard, never commit them ──
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      # Generate locally with `python generate_session.py` — this is what lets the
+      # bot log in headlessly instead of prompting for an SMS code it can never read.
+      - key: SESSION_STRING
+        sync: false
+
+      # ── Tuning (optional) ──
+      - key: ENABLE_HTML_SCRAPER
+        value: "true"
+      - key: DEAL_RETENTION_DAYS
+        value: "7"
+      - key: KEEPALIVE_INTERVAL
+        value: "600"

@@ -1,20 +1,29 @@
-import logging
 import asyncio
-import os
+import functools
+import logging
+import time
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters
 )
 from database import Database
 from keyword_matcher import KeywordMatcher
 from channel_monitor import ChannelMonitor
-from config import BOT_TOKEN, OWNER_ID
-from utils import format_time_ago, format_price
+from config import (
+    BOT_TOKEN,
+    DEAL_RETENTION_DAYS,
+    KEEPALIVE_INTERVAL,
+    KEEPALIVE_URL,
+    MAINTENANCE_INTERVAL_HOURS,
+    OWNER_ID,
+    PORT,
+    WATCHDOG_INTERVAL,
+)
+from utils import format_time_ago
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -26,21 +35,41 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 db = Database()
 matcher = KeywordMatcher()
 monitor = None  # Global reference to ChannelMonitor
 
+# Background tasks + web server handles, kept so shutdown can cancel/close them
+# instead of leaking a task and its captured frames on every restart.
+_background_tasks = []
+_web_runner = None
+_started_at = time.time()
+
 
 def owner_only(func):
     """Decorator to restrict commands to bot owner."""
+    @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
+        user = update.effective_user
+        user_id = user.id if user else 0
         if OWNER_ID != 0 and user_id != OWNER_ID:
-            await update.message.reply_text("❌ Unauthorized access.")
+            # update.message is None for callback queries — the old version raised
+            # AttributeError here instead of rejecting the caller.
+            if update.callback_query:
+                await update.callback_query.answer("❌ Unauthorized access.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("❌ Unauthorized access.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
+
+
+def _invalidate_watchlist():
+    """The monitor caches the watchlist in memory — drop it after any edit."""
+    if monitor:
+        monitor.invalidate_watchlist_cache()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -125,6 +154,7 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await db.add_keyword(keyword, custom_synonyms)
 
     if success:
+        _invalidate_watchlist()
         syns = matcher.get_display_synonyms(keyword, custom_synonyms)
         syn_text = f"\n💡 *Synonyms included:* {', '.join(syns)}" if syns else ""
         await update.message.reply_text(
@@ -158,6 +188,7 @@ async def update_synonyms_command(update: Update, context: ContextTypes.DEFAULT_
     success = await db.update_synonyms(keyword, custom_synonyms)
 
     if success:
+        _invalidate_watchlist()
         syns = matcher.get_display_synonyms(keyword, custom_synonyms)
         syn_text = f"\n💡 *New Synonyms:* {', '.join(syns)}" if syns else ""
         await update.message.reply_text(
@@ -178,6 +209,7 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await db.remove_keyword(keyword)
 
     if success:
+        _invalidate_watchlist()
         await update.message.reply_text(f"🗑️ Removed `{keyword}` from watchlist.", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"❌ `{keyword}` was not found in your watchlist.", parse_mode='Markdown')
@@ -210,15 +242,6 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-
-@owner_only
-async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show channel selection menu."""
-    if not monitor:
-        await update.message.reply_text("⏳ Channel monitor loading, please try again in a moment.")
-        return
-
-    await update.message.reply_text("🔍 Fetching your joined channels... ⏳")
 
 async def _get_channels_page(page=0):
     joined = await monitor.get_joined_channels()
@@ -381,12 +404,15 @@ async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = deal.get('price')
         price_str = f" • ₹{price}" if price else ""
         channel = deal.get('channel_name', '')
-        time_ago = format_time_ago(asyncio.get_event_loop().time() - deal.get('matched_date', 0))
+        # matched_date is a time.time() epoch value. The old code subtracted it from
+        # loop.time(), a monotonic clock with an unrelated origin, so this was always
+        # a huge negative number.
+        time_ago = format_time_ago(max(0, time.time() - deal.get('matched_date', 0)))
 
         link = deal.get('message_link')
         link_str = f" [Link]({link})" if link else ""
 
-        message += f"• *{product[:40]}*{price_str} ({channel}){link_str}\n"
+        message += f"• *{product[:40]}*{price_str} ({channel}) — {time_ago}{link_str}\n"
 
     await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
 
@@ -418,11 +444,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_paused = monitor.paused if monitor else True
 
     status_str = "⏸️ Paused" if is_paused else "🟢 Active & Monitoring"
+    link_str = "🟢 Connected" if (monitor and monitor.is_connected()) else "🔴 Disconnected"
+    uptime = format_time_ago(time.time() - _started_at)
 
     msg = f"""
 📊 **NDT STATUS & STATS**
 
 **Status:** {status_str}
+🔌 **Telethon Uplink:** {link_str}
+⏱️ **Uptime:** {uptime.replace(' ago', '')}
 🎯 **Tracked Keywords:** {stats['watchlist_count']}
 📢 **Monitored Channels:** {stats['active_channels']} / {stats['total_channels']}
 🔥 **Deals Found (24h):** {stats['deals_24h']}
@@ -431,6 +461,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 
+@owner_only
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard callbacks."""
     query = update.callback_query
@@ -443,6 +474,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyword = data.replace('del_kw_', '')
         success = await db.remove_keyword(keyword)
         if success:
+            _invalidate_watchlist()
             await query.edit_message_text(f"🗑️ Removed `{keyword}` from watchlist.", parse_mode='Markdown')
         else:
             await query.edit_message_text(f"❌ Error removing `{keyword}`.")
@@ -489,10 +521,117 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Error changing pages.")
 
 
+async def _start_web_server():
+    """
+    Bind the HTTP port Render expects.
+
+    This MUST happen before anything slow. Previously it ran after
+    `await monitor.start()`, which does Telethon login plus a full dialog sync — on a
+    cold container that easily outruns Render's port-detection window, so Render
+    concluded the service never bound a port and shut it down. That is the "deployed,
+    then stopped after some time" symptom.
+    """
+    global _web_runner
+
+    if not PORT:
+        logger.info("No PORT set — skipping web server (worker mode).")
+        return
+
+    from aiohttp import web
+
+    async def health(request):
+        connected = bool(monitor and monitor.is_connected())
+        return web.json_response({
+            'status': 'ok',
+            'telethon_connected': connected,
+            'monitoring': bool(monitor and not monitor.paused),
+            'channels': len(monitor._monitored_channel_ids) if monitor else 0,
+            'uptime_seconds': int(time.time() - _started_at),
+        })
+
+    async def root(request):
+        return web.Response(text="NDT Tracker is running 24/7!")
+
+    web_app = web.Application()
+    web_app.router.add_get('/', root)
+    web_app.router.add_get('/health', health)
+
+    _web_runner = web.AppRunner(web_app)
+    await _web_runner.setup()
+    site = web.TCPSite(_web_runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌐 Web server listening on port {PORT} (/ and /health)")
+
+
+async def _keepalive_loop():
+    """
+    Ping our own public URL so a free-tier host doesn't idle us out.
+
+    Render spins a free web service down after ~15 minutes with no inbound request.
+    Binding the port is not enough — traffic has to actually arrive.
+    """
+    if not KEEPALIVE_URL:
+        logger.info("No KEEPALIVE_URL/RENDER_EXTERNAL_URL — self-ping disabled.")
+        return
+
+    import aiohttp
+
+    url = KEEPALIVE_URL.rstrip('/') + '/health'
+    timeout = aiohttp.ClientTimeout(total=30)
+    # One session for the life of the loop rather than one per ping.
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                async with session.get(url) as resp:
+                    logger.debug(f"Keep-alive ping {url} -> {resp.status}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Keep-alive ping failed: {e}")
+
+
+async def _watchdog_loop():
+    """Reconnect Telethon if its connection drops."""
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL)
+        try:
+            if monitor and not monitor.is_connected():
+                await monitor.ensure_connected()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+
+
+async def _maintenance_loop():
+    """
+    Prune old deals on a timer.
+
+    cleanup_old_deals() has always existed but nothing ever called it, so
+    matched_deals grew for the entire life of the deployment.
+    """
+    interval = MAINTENANCE_INTERVAL_HOURS * 3600
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deleted = await db.cleanup_old_deals(DEAL_RETENTION_DAYS)
+            if deleted:
+                logger.info(f"🧹 Maintenance: pruned {deleted} deals older than {DEAL_RETENTION_DAYS}d")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Maintenance error: {e}")
+
+
 async def post_init(application):
     """Start the Telethon monitor when the bot starts."""
     global monitor
-    
+
+    # ── 1. Bind the port FIRST so the host's health check succeeds immediately ──
+    await _start_web_server()
+
+    # ── 2. Then the slow work ──
     # Set bot commands menu
     await application.bot.set_my_commands([
         BotCommand("watch", "Add product to watchlist"),
@@ -513,40 +652,65 @@ async def post_init(application):
         monitor = ChannelMonitor(application.bot)
         await monitor.start()
     except Exception as e:
-        logger.error(f"Failed to start ChannelMonitor: {e}")
+        # Don't leave the process "up but blind" — the watchdog will keep retrying,
+        # and /health + /stats now report the uplink as down so it's visible.
+        logger.exception(f"Failed to start ChannelMonitor: {e}")
 
-    # ── Render.com Keep-Alive Web Server ──
-    # Render requires "Web Services" to bind to a port, or it shuts them down.
-    # We run a dummy web server in the background to satisfy Render's health checks.
-    port = os.getenv('PORT')
-    if port:
-        from aiohttp import web
-        async def dummy_health_check(request):
-            return web.Response(text="NDT Tracker is running 24/7!")
-        
-        web_app = web.Application()
-        web_app.router.add_get('/', dummy_health_check)
-        runner = web.AppRunner(web_app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', int(port))
-        await site.start()
-        logger.info(f"🌐 Started dummy web server on port {port} for Render keep-alive.")
+    # ── 3. Background loops ──
+    _background_tasks.append(asyncio.create_task(_watchdog_loop(), name='watchdog'))
+    _background_tasks.append(asyncio.create_task(_maintenance_loop(), name='maintenance'))
+    _background_tasks.append(asyncio.create_task(_keepalive_loop(), name='keepalive'))
+
+    # Prune once at boot rather than waiting a full interval on a fresh container.
+    try:
+        deleted = await db.cleanup_old_deals(DEAL_RETENTION_DAYS)
+        if deleted:
+            logger.info(f"🧹 Startup cleanup: pruned {deleted} old deals")
+    except Exception as e:
+        logger.error(f"Startup cleanup failed: {e}")
+
+
+async def post_shutdown(application):
+    """Cancel background tasks and release sockets, threads and the DB handle."""
+    for task in _background_tasks:
+        task.cancel()
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+    _background_tasks.clear()
+
+    if monitor:
+        try:
+            await monitor.stop()
+        except Exception as e:
+            logger.debug(f"Error stopping monitor: {e}")
+
+    if _web_runner is not None:
+        try:
+            await _web_runner.cleanup()
+        except Exception as e:
+            logger.debug(f"Error stopping web server: {e}")
+
+    try:
+        await db.close()
+    except Exception as e:
+        logger.debug(f"Error closing database: {e}")
+
+    logger.info("👋 NDT shut down cleanly")
 
 
 def main():
     """Start NDT Bot."""
-    import asyncio
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is missing!")
         return
 
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
