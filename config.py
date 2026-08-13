@@ -3,6 +3,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_bool(name, default):
+    return os.getenv(name, str(default)).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 # ═══════════════════════════════════════
 #  NDT — Configuration
 # ═══════════════════════════════════════
@@ -20,6 +32,10 @@ PHONE_NUMBER = os.getenv('PHONE_NUMBER', '')
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 
 # Paths
+# NOTE (deployment): on Render the container filesystem is EPHEMERAL — it is wiped
+# on every deploy and restart. Point DATA_PATH/SESSION_PATH at a mounted persistent
+# disk (e.g. DATA_PATH=/var/data/) or the watchlist, channels and deal history are
+# silently lost every time the service restarts.
 DATA_PATH = os.getenv('DATA_PATH', './data/')
 DB_PATH = os.path.join(DATA_PATH, 'ndt.db')
 SESSION_PATH = os.getenv('SESSION_PATH', './sessions/')
@@ -39,9 +55,24 @@ PRICE_PATTERNS = [
 # Pattern for discount percentage
 DISCOUNT_PATTERN = r'(\d{1,2})%\s*(?:off|discount|saving)'
 
-# ── Link Scraper Settings ──
-SCRAPE_TIMEOUT = 5  # seconds per URL
-SCRAPE_CACHE_TTL = 600  # 10 minutes cache
+# ── Telegram Link Preview (primary product-name source) ──
+# Telegram's own servers render the preview, so they have already cleared Amazon's
+# and Flipkart's anti-bot walls for us. This path is tried BEFORE any HTTP scraping.
+PREVIEW_MAX_URLS = _env_int('PREVIEW_MAX_URLS', 2)      # URLs to ask Telegram about per message
+PREVIEW_RETRIES = _env_int('PREVIEW_RETRIES', 4)        # WebPagePending re-polls before giving up
+PREVIEW_RETRY_DELAY = float(os.getenv('PREVIEW_RETRY_DELAY', '1.5'))  # seconds between re-polls
+PREVIEW_CACHE_SIZE = _env_int('PREVIEW_CACHE_SIZE', 300)
+PREVIEW_CACHE_TTL = _env_int('PREVIEW_CACHE_TTL', 900)  # 15 minutes
+
+# ── Link Scraper Settings (LAST-RESORT fallback only) ──
+# Set ENABLE_HTML_SCRAPER=false to disable outbound HTTP scraping entirely and rely
+# purely on Telegram previews (lowest memory, no CAPTCHA risk).
+ENABLE_HTML_SCRAPER = _env_bool('ENABLE_HTML_SCRAPER', True)
+SCRAPE_TIMEOUT = _env_int('SCRAPE_TIMEOUT', 5)          # seconds per URL
+SCRAPE_CACHE_TTL = _env_int('SCRAPE_CACHE_TTL', 600)    # 10 minutes cache
+SCRAPE_CACHE_SIZE = _env_int('SCRAPE_CACHE_SIZE', 200)  # hard entry cap (LRU eviction)
+SCRAPE_MAX_URLS = _env_int('SCRAPE_MAX_URLS', 2)
+SCRAPE_MAX_BYTES = _env_int('SCRAPE_MAX_BYTES', 400_000)  # stop reading huge pages
 
 # User-Agent for scraping (mimics Chrome)
 SCRAPE_HEADERS = {
@@ -60,9 +91,27 @@ URL_SHORTENERS = [
 
 # ── Keyword Matching ──
 FUZZY_MATCH_THRESHOLD = 0.75  # Minimum similarity for fuzzy match
+# The watchlist changes rarely but was previously re-read from SQLite on EVERY
+# incoming channel message. Cache it in memory for this many seconds.
+WATCHLIST_CACHE_TTL = _env_int('WATCHLIST_CACHE_TTL', 30)
 
-# ── Deduplication ──
-DEDUP_HOURS = 24  # Don't re-notify same deal within this window
+# ── Deduplication & Retention ──
+DEDUP_HOURS = _env_int('DEDUP_HOURS', 24)   # Don't re-notify same deal within this window
+NOTIFIER_DEDUP_WINDOW = _env_int('NOTIFIER_DEDUP_WINDOW', 300)  # in-memory alert suppression
+NOTIFIER_CACHE_SIZE = _env_int('NOTIFIER_CACHE_SIZE', 500)
+# matched_deals used to grow forever — cleanup_old_deals() existed but was never called.
+DEAL_RETENTION_DAYS = _env_int('DEAL_RETENTION_DAYS', 7)
+MAINTENANCE_INTERVAL_HOURS = _env_int('MAINTENANCE_INTERVAL_HOURS', 6)
+
+# ── Deployment / keep-alive ──
+# Render free web services are reaped after ~15 minutes with no inbound request.
+# RENDER_EXTERNAL_URL is injected by Render automatically; we self-ping it so the
+# service stays awake. Set KEEPALIVE_URL manually on other hosts.
+PORT = _env_int('PORT', 0)
+KEEPALIVE_URL = os.getenv('KEEPALIVE_URL', '') or os.getenv('RENDER_EXTERNAL_URL', '')
+KEEPALIVE_INTERVAL = _env_int('KEEPALIVE_INTERVAL', 600)  # 10 minutes
+# Telethon silently drops its connection on flaky hosts; the watchdog reconnects it.
+WATCHDOG_INTERVAL = _env_int('WATCHDOG_INTERVAL', 120)
 
 # Create directories
 os.makedirs(DATA_PATH, exist_ok=True)
