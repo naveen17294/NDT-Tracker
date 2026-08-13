@@ -1,6 +1,8 @@
 import difflib
-from utils import clean_text, remove_emojis
+import re
+
 from config import FUZZY_MATCH_THRESHOLD
+from utils import clean_text, remove_emojis
 
 
 # ═══════════════════════════════════════
@@ -83,9 +85,28 @@ class KeywordMatcher:
 
     def __init__(self):
         self.synonym_map = SYNONYM_MAP
+        # get_synonyms() walks the whole SYNONYM_MAP doing a reverse lookup, and
+        # match() called it once per watchlist keyword per incoming message. Memoise
+        # it — the inputs are a handful of stable strings.
+        self._synonym_cache = {}
+        # Compiled word-boundary patterns, keyed by synonym. re's internal cache is
+        # only 512 entries and gets evicted by every other regex in the process.
+        self._pattern_cache = {}
+
+    def _pattern_for(self, synonym_lower):
+        pattern = self._pattern_cache.get(synonym_lower)
+        if pattern is None:
+            pattern = re.compile(rf'\b{re.escape(synonym_lower)}\b')
+            self._pattern_cache[synonym_lower] = pattern
+        return pattern
 
     def get_synonyms(self, keyword, custom_synonyms=''):
         """Get all synonyms for a keyword (built-in + custom)."""
+        cache_key = (keyword.lower().strip(), (custom_synonyms or '').lower().strip())
+        cached = self._synonym_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         keyword = keyword.lower().strip()
         synonyms = set()
 
@@ -109,7 +130,9 @@ class KeywordMatcher:
                 if syn:
                     synonyms.add(syn)
 
-        return list(synonyms)
+        result = list(synonyms)
+        self._synonym_cache[cache_key] = result
+        return result
 
     def match(self, text, watchlist):
         """
@@ -152,8 +175,7 @@ class KeywordMatcher:
                 synonym_lower = synonym.lower()
 
                 # ── Priority 1: Exact word-boundary match in full text ──
-                import re
-                if re.search(rf'\b{re.escape(synonym_lower)}\b', cleaned):
+                if self._pattern_for(synonym_lower).search(cleaned):
                     confidence = 1.0
                     match_type = 'exact' if synonym_lower == keyword.lower() else 'synonym'
                     if confidence > best_confidence:
