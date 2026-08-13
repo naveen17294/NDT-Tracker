@@ -22,9 +22,11 @@ services:
     healthCheckPath: /health
     autoDeploy: true
 
-    # Persistent storage — REQUIRED, see note above.
-    # Free instances do not support disks; on the free plan either accept that state
-    # resets on restart, or set SESSION_STRING so at least the Telegram login survives.
+    # Persistent storage.
+    # Free instances do NOT support disks. The portable answer is DATABASE_URL below
+    # (an external Postgres), which keeps state off the container entirely and works
+    # on every plan. Keep this disk only if you are on a paid instance and prefer
+    # SQLite on local storage — if DATABASE_URL is set, the disk is not needed.
     disk:
       name: ndt-data
       mountPath: /var/data
@@ -56,6 +58,12 @@ services:
       # Generate locally with `python generate_session.py` — this is what lets the
       # bot log in headlessly instead of prompting for an SMS code it can never read.
       - key: SESSION_STRING
+        sync: false
+      # External Postgres. THIS is what makes the watchlist survive restarts on a
+      # free instance, where no disk can be mounted. Verify with `python check_db.py`
+      # before deploying. Format:
+      #   postgresql://user:password@host:5432/ndt
+      - key: DATABASE_URL
         sync: false
 
       # ── Tuning (optional) ──

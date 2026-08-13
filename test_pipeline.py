@@ -36,6 +36,14 @@ from database import Database
 from keyword_matcher import KeywordMatcher
 from link_scraper import LinkScraper
 from price_extractor import PriceExtractor
+from storage import (
+    PostgresBackend,
+    SqliteBackend,
+    build_backend,
+    normalise_dsn,
+    redact_dsn,
+    to_pg_placeholders,
+)
 
 _FAILURES = []
 _PASSES = []
@@ -199,32 +207,117 @@ async def test_database_shared_connection_and_retention():
 
     db = Database()
     check('Database is a singleton', db is Database())
+    check('defaults to SQLite with no DATABASE_URL', db.backend_name == 'sqlite',
+          f'got {db.backend_name}')
     await db.init()
 
-    conn_first = await db._ensure_conn()
+    conn_first = await db.backend._ensure_conn()
     await db.add_keyword('fridge', 'samsung')
-    conn_second = await db._ensure_conn()
+    conn_second = await db.backend._ensure_conn()
     check('DB reuses one connection', conn_first is conn_second)
 
     kws = await db.get_all_keywords()
     check('keyword round-trips', ('fridge', 'samsung') in kws, f'got {kws}')
 
+    # Duplicate insert must report "already there" rather than raising.
+    again = await db.add_keyword('fridge', 'samsung')
+    check('duplicate keyword returns False', again is False, f'got {again}')
+
+    removed = await db.remove_keyword('fridge')
+    check('remove_keyword reports success', removed is True)
+    check('remove_keyword on a missing key returns False',
+          await db.remove_keyword('nonexistent') is False)
+
+    # Channels: IDs beyond 32 bits must survive (Telegram uses them).
+    big_id = 2_147_483_648 + 12345
+    await db.add_channel(big_id, 'Big ID Channel', '@bigid')
+    state = await db.toggle_channel(big_id)
+    check('toggle_channel activates', state == 1, f'got {state}')
+    active = await db.get_active_channels()
+    check('large channel id round-trips',
+          any(c['channel_id'] == big_id for c in active), f'got {active}')
+
     await db.save_deal('hash-fresh', 'fridge', 'Samsung Fridge', '24999', '@deals', '')
     check('fresh deal is seen', await db.is_deal_seen('hash-fresh') is True)
 
+    # Re-saving the same hash must slide the window forward, not raise.
+    await db.save_deal('hash-fresh', 'fridge', 'Samsung Fridge', '24999', '@deals', '')
+    check('repeat save_deal upserts cleanly', await db.is_deal_seen('hash-fresh') is True)
+
     # Backdate a row well past the retention window and prove the sweep removes it.
-    async with db._session() as conn:
-        await conn.execute(
-            'INSERT INTO matched_deals (deal_hash, keyword_matched, matched_date) VALUES (?, ?, ?)',
-            ('hash-ancient', 'fridge', _time.time() - (60 * 86400))
-        )
-        await conn.commit()
+    await db.backend.execute(
+        'INSERT INTO matched_deals (deal_hash, keyword_matched, matched_date) VALUES (?, ?, ?)',
+        ('hash-ancient', 'fridge', _time.time() - (60 * 86400))
+    )
 
     deleted = await db.cleanup_old_deals(days=7)
     check('retention sweep deletes old rows', deleted == 1, f'deleted={deleted}')
     check('retention sweep keeps fresh rows', await db.is_deal_seen('hash-fresh') is True)
 
+    stats = await db.get_stats()
+    check('get_stats aliases COUNT(*) correctly', stats['total_deals'] == 1,
+          f"got {stats}")
+
     await db.close()
+
+
+async def test_storage_backend_selection_and_translation():
+    """
+    The Postgres path cannot be exercised without a live server, but everything that
+    would silently corrupt queries — placeholder translation, DSN handling, schema
+    types, rowcount parsing — is pure logic and is tested here.
+    """
+    check('no DATABASE_URL selects SQLite',
+          isinstance(build_backend('', '/tmp/x.db'), SqliteBackend))
+    check('blank DATABASE_URL selects SQLite',
+          isinstance(build_backend('   ', '/tmp/x.db'), SqliteBackend))
+    check('DATABASE_URL selects Postgres',
+          isinstance(build_backend('postgresql://u:p@h:5432/db', '/tmp/x.db'),
+                     PostgresBackend))
+
+    # Placeholder translation: ? -> $1, $2, ...
+    got = to_pg_placeholders('INSERT INTO t (a, b, c) VALUES (?, ?, ?)')
+    check('placeholders become positional',
+          got == 'INSERT INTO t (a, b, c) VALUES ($1, $2, $3)', f'got {got}')
+    got = to_pg_placeholders('SELECT * FROM t WHERE a = ? AND b > ?')
+    check('placeholders numbered in order',
+          got == 'SELECT * FROM t WHERE a = $1 AND b > $2', f'got {got}')
+    check('SQL without placeholders is untouched',
+          to_pg_placeholders('SELECT 1') == 'SELECT 1')
+
+    # DSN normalisation and redaction
+    check('postgres:// is normalised',
+          normalise_dsn('postgres://u:p@h/db') == 'postgresql://u:p@h/db')
+    check('surrounding whitespace is stripped',
+          normalise_dsn('  postgresql://u:p@h/db  ') == 'postgresql://u:p@h/db')
+    red = redact_dsn('postgresql://user:sup3rsecret@host:5432/ndt')
+    check('password is redacted for logs', 'sup3rsecret' not in red and 'user' in red,
+          f'got {red}')
+
+    # asyncpg status-string parsing
+    check("rowcount parses 'INSERT 0 1'", PostgresBackend._rowcount('INSERT 0 1') == 1)
+    check("rowcount parses 'INSERT 0 0'", PostgresBackend._rowcount('INSERT 0 0') == 0)
+    check("rowcount parses 'UPDATE 3'", PostgresBackend._rowcount('UPDATE 3') == 3)
+    check("rowcount parses 'DELETE 2'", PostgresBackend._rowcount('DELETE 2') == 2)
+    check('rowcount survives junk', PostgresBackend._rowcount('WAT') == 0)
+
+    # Schema sanity: channel_id must be 64-bit on Postgres. Telegram channel IDs
+    # exceed the 32-bit range, and Postgres INTEGER really is 32-bit.
+    pg_schema = ' '.join(PostgresBackend('postgresql://u:p@h/db').schema())
+    check('postgres channels.channel_id is BIGINT', 'channel_id BIGINT' in pg_schema,
+          'channel_id would overflow INTEGER')
+    check('postgres uses BIGSERIAL keys', 'BIGSERIAL PRIMARY KEY' in pg_schema)
+    check('postgres timestamps are DOUBLE PRECISION',
+          'matched_date DOUBLE PRECISION' in pg_schema)
+
+    # Both backends must agree on table and index names, or they will diverge.
+    sqlite_schema = ' '.join(SqliteBackend('/tmp/x.db').schema())
+    for table in ('watchlist', 'channels', 'matched_deals'):
+        check(f'both backends define {table}',
+              f'TABLE IF NOT EXISTS {table}' in sqlite_schema
+              and f'TABLE IF NOT EXISTS {table}' in pg_schema)
+    check('both backends define the retention index',
+          'idx_deals_matched_date' in sqlite_schema and 'idx_deals_matched_date' in pg_schema)
 
 
 async def test_matcher_and_price_still_work():
@@ -306,6 +399,7 @@ async def main():
         test_preview_cache_hit,
         test_preview_cache_is_bounded,
         test_scraper_cache_is_bounded,
+        test_storage_backend_selection_and_translation,
         test_database_shared_connection_and_retention,
         test_matcher_and_price_still_work,
     ]

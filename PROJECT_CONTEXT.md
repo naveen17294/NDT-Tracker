@@ -33,7 +33,10 @@ NDT/
 ├── keyword_matcher.py     # Synonym dictionary & fuzzy matching engine
 ├── link_scraper.py        # Follows short links & scrapes product titles (Amazon, Flipkart, etc.)
 ├── price_extractor.py     # Regex parser for deal price, MRP, and discount %
-├── database.py            # Async SQLite storage (watchlist, channels, deal hashes)
+├── database.py            # Storage API (watchlist, channels, deal hashes)
+├── storage.py             # SQLite / Postgres backends behind one interface
+├── check_db.py            # Verify the DB connection before deploying
+├── migrate_to_postgres.py # Copy an existing SQLite file into Postgres
 ├── notifier.py            # Telegram alert formatting & sending
 ├── config.py              # Central settings & env variables
 ├── utils.py               # Text cleaning, URL extraction & currency helpers
@@ -60,7 +63,8 @@ NDT/
 | `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) |
 | `OWNER_ID` | Your Telegram User ID (numeric) |
 | `SESSION_STRING` | Telethon session from `generate_session.py`. **Required on any headless host** — there is no terminal to type the login code into. |
-| `DATA_PATH` / `SESSION_PATH` | Where the SQLite DB and session live. Point at a mounted disk in production; container filesystems are wiped on every restart. |
+| `DATABASE_URL` | Postgres connection string. Set it and the watchlist, channels and deal history survive restarts. Unset = local SQLite. |
+| `DATA_PATH` / `SESSION_PATH` | Where the SQLite DB and session file live. Only matter when `DATABASE_URL` / `SESSION_STRING` are unset. |
 | `PORT` | Set by the host. When present the bot serves `/` and `/health` on it. |
 | `KEEPALIVE_URL` | Self-ping target so free tiers don't idle the service out. Render provides `RENDER_EXTERNAL_URL` automatically. |
 | `ENABLE_HTML_SCRAPER` | `false` runs preview-only, with no outbound HTTP scraping. |
@@ -80,7 +84,20 @@ python bot.py
 ### Tests:
 ```bash
 python test_pipeline.py     # offline, no credentials or network required
+python check_db.py          # verify the configured database is reachable
 ```
+
+### Persistent storage:
+By default NDT stores everything in a local SQLite file, which a container wipes on
+every restart. To keep your watchlist across restarts, point it at a Postgres server:
+
+```bash
+export DATABASE_URL="postgresql://user:password@host:5432/ndt"
+python check_db.py                # confirm it connects and can write
+python migrate_to_postgres.py     # optional: copy an existing SQLite file across
+```
+
+Then set the same `DATABASE_URL` in your host's environment variables.
 
 ### Deploying to Render:
 `render.yaml` is a ready blueprint. Set `BOT_TOKEN`, `API_ID`, `API_HASH`, `OWNER_ID`

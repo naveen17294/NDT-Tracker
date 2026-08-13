@@ -59,6 +59,46 @@ previews are doing the work or the scraper is carrying it.
 - **HTML Engine:** Uses `HTML` parsing instead of `MarkdownV2` to format messages. Product names are wrapped in `html.escape()` to guarantee that weird characters (like `[` or `*`) never crash the Telegram delivery API.
 - **Original Transmission:** Appends the exact raw message text sent by the channel into a sleek `<blockquote>` at the bottom of the alert, so the user can see exact coupon codes and context.
 
+## 💾 Persistence — where the data actually lives
+
+Storage is behind a two-backend abstraction in `storage.py`, selected at runtime by
+whether `DATABASE_URL` is set:
+
+| | Backend | Survives a restart? |
+|---|---|---|
+| `DATABASE_URL` unset | SQLite file at `DB_PATH` | Only if that path is a mounted disk |
+| `DATABASE_URL` set | Postgres via asyncpg | Yes — the data is off the container |
+
+`database.py`'s public API is identical either way, so nothing else in the codebase
+knows which is in use.
+
+**Why this exists.** On a host with no mounted disk — Render's free tier, where disks
+are a paid feature — the container filesystem is wiped on every restart and redeploy.
+A SQLite file there loses the watchlist, tracked channels and dedup history every
+time, so the bot comes back knowing nothing. An external database is the only fix
+available on that plan.
+
+**Rules for touching the SQL.** It is written once, in SQLite's `?` placeholder style,
+and `storage.to_pg_placeholders()` rewrites it to `$1, $2` for Postgres. Keep every
+statement to syntax both engines accept:
+
+- `ON CONFLICT (col) DO NOTHING / DO UPDATE SET x = excluded.x` works in both (SQLite
+  has supported it since 3.24). Prefer it over `try/except IntegrityError`, which
+  needs a different exception class per driver.
+- Alias aggregates — `SELECT COUNT(*) AS cnt`. The implicit column name differs
+  (`COUNT(*)` in SQLite, `count` in Postgres) and unaliased code breaks on one engine.
+- `channels.channel_id` is `BIGINT` on Postgres and this is not optional. Telegram
+  channel IDs routinely exceed the 32-bit range, and Postgres `INTEGER` really is
+  32-bit — unlike SQLite's, which is 64-bit. Getting it wrong fails only for large
+  IDs, which is the worst kind of bug to ship.
+- `PRAGMA` is SQLite-only, so it lives behind `backend.maintenance()` (a no-op on
+  Postgres, where autovacuum handles reclamation).
+
+**Tools.** `python check_db.py` connects, creates the schema, round-trips a probe row
+and prints the current contents — run it after setting `DATABASE_URL` and before
+deploying. `python migrate_to_postgres.py` copies an existing SQLite file across; it
+is idempotent, inserts with `ON CONFLICT DO NOTHING`, and never deletes anything.
+
 ## 🧹 Memory Management
 
 This is a long-lived process on a small container, so anything per-message compounds.

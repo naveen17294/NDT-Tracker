@@ -31,11 +31,20 @@ PHONE_NUMBER = os.getenv('PHONE_NUMBER', '')
 # Your Telegram User ID (only you use this bot)
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 
-# Paths
-# NOTE (deployment): on Render the container filesystem is EPHEMERAL — it is wiped
-# on every deploy and restart. Point DATA_PATH/SESSION_PATH at a mounted persistent
-# disk (e.g. DATA_PATH=/var/data/) or the watchlist, channels and deal history are
-# silently lost every time the service restarts.
+# ── Storage ──
+# When DATABASE_URL is set, NDT stores everything in that Postgres server instead of
+# a local SQLite file, so the watchlist, tracked channels and deal history survive
+# restarts and redeploys. This is the fix for hosts with no persistent disk (Render's
+# free tier), where the container filesystem is wiped every time the service restarts.
+#   postgresql://user:password@host:5432/dbname
+# Leave it empty to use SQLite at DB_PATH.
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+
+# Paths — used by the SQLite backend and always by the Telethon session file.
+# NOTE (deployment): on Render the container filesystem is EPHEMERAL. If you are on
+# SQLite, point DATA_PATH at a mounted persistent disk (e.g. DATA_PATH=/var/data/) or
+# set DATABASE_URL instead. SESSION_PATH has the same problem — set SESSION_STRING so
+# the Telegram login does not depend on the filesystem at all.
 DATA_PATH = os.getenv('DATA_PATH', './data/')
 DB_PATH = os.path.join(DATA_PATH, 'ndt.db')
 SESSION_PATH = os.getenv('SESSION_PATH', './sessions/')
