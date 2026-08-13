@@ -1,5 +1,10 @@
+import asyncio
+import html
 import logging
 import time
+from collections import OrderedDict
+
+from config import NOTIFIER_CACHE_SIZE, NOTIFIER_DEDUP_WINDOW
 from utils import format_price, format_time_ago, truncate
 
 logger = logging.getLogger(__name__)
@@ -10,8 +15,10 @@ class Notifier:
 
     def __init__(self, bot):
         self.bot = bot  # python-telegram-bot Bot instance
-        self.sent_deals = {}  # Cache of sent deals
-        self.dedupe_window = 300  # 5 minutes in seconds
+        # OrderedDict + hard cap: a burst of unique deals can no longer grow this
+        # cache faster than the time-based prune shrinks it.
+        self.sent_deals = OrderedDict()  # dedupe_key -> timestamp
+        self.dedupe_window = NOTIFIER_DEDUP_WINDOW
 
     async def send_deal_alert(self, chat_id, deal_info):
         """
@@ -36,8 +43,12 @@ class Notifier:
         """
         # --- Deduplication Logic ---
         now = time.time()
-        # Clean up cache (remove items older than 1 hour)
-        self.sent_deals = {k: v for k, v in self.sent_deals.items() if now - v < self.dedupe_window}
+        # Drop entries older than the dedupe window, then enforce the hard cap.
+        expired = [k for k, v in self.sent_deals.items() if now - v >= self.dedupe_window]
+        for k in expired:
+            self.sent_deals.pop(k, None)
+        while len(self.sent_deals) > NOTIFIER_CACHE_SIZE:
+            self.sent_deals.popitem(last=False)
 
         deal_url = deal_info.get('deal_url')
         keyword = deal_info.get('keyword', '')
@@ -64,7 +75,6 @@ class Notifier:
         # ---------------------------
 
         try:
-            import html
             message = self._format_alert(deal_info)
             await self.bot.send_message(
                 chat_id=chat_id,
@@ -78,8 +88,6 @@ class Notifier:
 
     def _format_alert(self, info):
         """Format deal info into a beautiful Telegram message using HTML to prevent parsing errors."""
-        import html
-        
         raw_product = truncate(info.get('product_name', 'Unknown Product'), 80)
         product = html.escape(raw_product)
         keyword = html.escape(info.get('keyword', '?'))
@@ -94,8 +102,14 @@ class Notifier:
         # Confidence emoji
         conf_emoji = {'high': '🟢', 'medium': '🟡', 'low': '🟠'}.get(confidence, '⚪')
 
-        # Source indicator
-        source_text = 'TEXT_PARSE' if match_source == 'text' else 'LINK_TRACE'
+        # Source indicator — shows which stage of the pipeline identified the product,
+        # so it is obvious at a glance whether previews or the HTML scraper did the work.
+        source_text = {
+            'text': '📝 TEXT_PARSE',
+            'native_preview': '🖼️ PREVIEW_NATIVE',
+            'telegram_preview_api': '🛰️ PREVIEW_API',
+            'link_scrape': '🕸️ LINK_SCRAPE',
+        }.get(match_source, match_source.upper())
 
         # Build message
         lines = ['⚡ <b>N D T   T R A C K E R</b> ⚡\n']
@@ -142,12 +156,12 @@ class Notifier:
 
         # Match info
         lines.append(f'🎯 Target: "{keyword}" → "{matched_term}" {conf_emoji}')
+        lines.append(f'🔍 Source: {source_text}')
 
         return '\n'.join(lines)
 
     async def send_batch_alerts(self, chat_id, deals):
         """Send multiple deal alerts (with slight delay to avoid spam)."""
-        import asyncio
         for deal in deals:
             await self.send_deal_alert(chat_id, deal)
             await asyncio.sleep(0.5)  # Small delay between messages
