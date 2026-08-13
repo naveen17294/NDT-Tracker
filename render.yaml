@@ -31,8 +31,12 @@ services:
       sizeGB: 1
 
     envVars:
+      # Render does NOT read runtime.txt (that is a Heroku convention). It reads this
+      # variable, falling back to .python-version. Without one of those you get
+      # Render's default, which is currently 3.14 — and python-telegram-bot 21.x
+      # breaks there on asyncio.get_event_loop().
       - key: PYTHON_VERSION
-        value: 3.10.12
+        value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: DATA_PATH

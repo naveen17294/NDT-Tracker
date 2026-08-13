@@ -246,8 +246,57 @@ async def test_matcher_and_price_still_work():
     check('price parses with commas', price['price'] == 1999.0, f"got {price['price']}")
 
 
+async def test_main_installs_an_event_loop():
+    """
+    python-telegram-bot 21.x calls asyncio.get_event_loop() inside run_polling().
+    Python 3.14 raises instead of creating one implicitly, so bot.main() must install
+    a loop before it gets there or the process dies before it can bind its port.
+
+    Runs in a worker thread because a fresh thread has no event loop set — the same
+    condition Python 3.14 now presents on MainThread.
+    """
+    import threading
+
+    try:
+        import bot
+    except ImportError as e:
+        check('bot.main installs an event loop', True, f'(skipped, {e})')
+        return
+
+    if os.environ.get('BOT_TOKEN'):
+        check('bot.main installs an event loop', True, '(skipped, BOT_TOKEN is set)')
+        return
+
+    seen = {}
+
+    def run():
+        try:
+            asyncio.get_event_loop()
+            seen['before'] = 'present'
+        except RuntimeError:
+            seen['before'] = 'absent'
+
+        bot.main()  # BOT_TOKEN is empty, so this returns right after the shim
+
+        try:
+            asyncio.get_event_loop()
+            seen['after'] = 'present'
+        except RuntimeError:
+            seen['after'] = 'absent'
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=30)
+
+    check('thread starts with no event loop', seen.get('before') == 'absent',
+          f"got {seen.get('before')!r}")
+    check('bot.main installs an event loop', seen.get('after') == 'present',
+          f"got {seen.get('after')!r}")
+
+
 async def main():
     tests = [
+        test_main_installs_an_event_loop,
         test_preview_resolves_after_pending,
         test_preview_immediate,
         test_preview_new_layer_shape,

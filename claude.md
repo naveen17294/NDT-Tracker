@@ -109,6 +109,31 @@ now answers in ~30ms.
 - Dependencies are pinned in `requirements.txt`. `telethon` was unpinned, meaning any
   upstream release could change preview behaviour on the next deploy.
 
+### Python version — pin it, and not via `runtime.txt`
+
+**Render does not read `runtime.txt`.** That is a Heroku convention. Render resolves
+the version from the `PYTHON_VERSION` environment variable, falling back to a
+`.python-version` file, and otherwise uses its own default — which is currently 3.14.
+The repo's `runtime.txt` said `python-3.10.12` for months and was silently ignored.
+
+That matters because **python-telegram-bot 21.x calls `asyncio.get_event_loop()`**
+inside `run_polling()`. Through Python 3.13 that implicitly created a loop when none
+was set; 3.14 raises instead:
+
+```
+RuntimeError: There is no current event loop in thread 'MainThread'.
+```
+
+The process then dies in `main()` before `post_init` runs, so the port is never bound
+and the deploy fails outright. `main()` installs a loop up front to survive this
+regardless of host Python — **that block is load-bearing despite looking like dead
+code**, and `test_pipeline.py::test_main_installs_an_event_loop` pins it.
+
+The pin is `.python-version` (3.11.9), which lives in the repo and needs no dashboard
+change, plus `PYTHON_VERSION` in `render.yaml` for blueprint deploys. 3.11 also has
+prebuilt manylinux wheels for `aiohttp`, so builds stop compiling it from source the
+way they had to on 3.14.
+
 ## ✅ Tests
 
 `python test_pipeline.py` — offline, no credentials, no network. Covers the

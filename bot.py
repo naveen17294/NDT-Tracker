@@ -700,6 +700,19 @@ async def post_shutdown(application):
 
 def main():
     """Start NDT Bot."""
+    # DO NOT REMOVE — this looks like dead code and is not.
+    #
+    # python-telegram-bot 21.x calls asyncio.get_event_loop() inside run_polling().
+    # Up to Python 3.13 that implicitly created a loop when none was set. Python 3.14
+    # made it raise instead:
+    #     RuntimeError: There is no current event loop in thread 'MainThread'.
+    # so the process dies before post_init ever runs, which means the port is never
+    # bound and the host reports a failed deploy. Install a loop up front.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is missing!")
         return
