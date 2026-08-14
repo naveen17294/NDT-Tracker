@@ -2,6 +2,19 @@
 
 Why each change exists is in `claude.md`; how to deploy is in `DEPLOYMENT.md`.
 
+## v1.3.0
+
+**`/channels` was unusable at real scale.** It listed every broadcast channel the
+account had ever joined — hundreds of them, deal channels buried among news and
+memes. It now lists only channels with `deal` or `sale` in the name (substrings, so
+`deals` and `sales` match), configurable via `CHANNEL_NAME_FILTERS`.
+
+Channels you already track are listed regardless of name — without that, anything
+added through `/addchannel` would be hidden by the filter and impossible to untrack.
+
+**Added** `/searchchannel <text>` — searches every joined channel by name, ignoring
+the filter, so nothing is unreachable. The query survives paging and toggling.
+
 ## v1.2.0
 
 **Keyword matching — false positives.** A watchlist of `shoes` alerted on home

@@ -669,6 +669,100 @@ async def test_main_installs_an_event_loop():
           f"got {seen.get('after')!r}")
 
 
+class _FakeMonitor:
+    def __init__(self, channels):
+        self._channels = channels
+
+    async def get_joined_channels(self):
+        return self._channels
+
+
+class _FakeChannelDb:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def get_all_channels(self):
+        return self.rows
+
+    async def add_channel(self, channel_id, name, username):
+        self.rows.append({'channel_id': channel_id, 'channel_name': name,
+                          'channel_username': username, 'active': 0})
+
+
+def _button_labels(markup):
+    if markup is None:
+        return []
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+async def test_channel_list_is_filtered_to_deal_channels():
+    """
+    /channels used to list every broadcast channel the account had ever joined.
+    It now offers only names containing a CHANNEL_NAME_FILTERS term, plus anything
+    already tracked — that second half matters, because a channel added through
+    /addchannel usually will not match the filter, and if the filter hid it there
+    would be no way to toggle it back off.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('channel list is filtered', True, f'(skipped, {e})')
+        return
+
+    joined = [
+        {'channel_id': 1, 'channel_name': 'Loot Deals India', 'channel_username': 'lootdeals'},
+        {'channel_id': 2, 'channel_name': 'Mega SALE Alerts', 'channel_username': 'megasale'},
+        {'channel_id': 3, 'channel_name': 'Daily News Hindi', 'channel_username': 'dailynews'},
+        {'channel_id': 4, 'channel_name': 'Cricket Updates', 'channel_username': 'cricket'},
+        {'channel_id': 5, 'channel_name': 'Tech Offers Hub', 'channel_username': 'techoffers'},
+    ]
+    active_ids = {5}  # manually added via /addchannel; name matches no filter term
+    channels_list = [(c['channel_id'], c) for c in joined]
+
+    visible = {cid for cid, _ in bot._visible_channels(channels_list, active_ids, None)}
+    check('deal/sale channels are listed', visible >= {1, 2}, f"got {sorted(visible)}")
+    check('unrelated channels are hidden', not (visible & {3, 4}), f"got {sorted(visible)}")
+    check('tracked channels are always listed', 5 in visible, f"got {sorted(visible)}")
+
+    # Search ignores the filter entirely.
+    found = {cid for cid, _ in bot._visible_channels(channels_list, active_ids, 'cricket')}
+    check('search reaches filtered-out channels', found == {4}, f"got {sorted(found)}")
+
+    found = {cid for cid, _ in bot._visible_channels(channels_list, active_ids, 'NEWS')}
+    check('search is case-insensitive', found == {3}, f"got {sorted(found)}")
+
+    found = {cid for cid, _ in bot._visible_channels(channels_list, active_ids, 'nothinghere')}
+    check('search with no hits returns nothing', found == set(), f"got {sorted(found)}")
+
+    # Same thing through the real page builder, buttons and all.
+    saved_monitor, saved_db = bot.monitor, bot.db
+    try:
+        bot.monitor = _FakeMonitor(joined)
+        bot.db = _FakeChannelDb([{'channel_id': 5, 'channel_name': 'Tech Offers Hub',
+                                  'channel_username': 'techoffers', 'active': 1}])
+
+        msg, markup = await bot._get_channels_page(page=0)
+        labels = ' | '.join(_button_labels(markup))
+        check('page shows deal channels', 'Loot Deals' in labels and 'Mega SALE' in labels,
+              f"got {labels!r}")
+        check('page hides unrelated channels',
+              'Daily News' not in labels and 'Cricket' not in labels, f"got {labels!r}")
+        check('page keeps the tracked channel togglable', 'Tech Offers' in labels,
+              f"got {labels!r}")
+        check('page explains the filter', 'searchchannel' in msg, f"got {msg!r}")
+
+        msg, markup = await bot._get_channels_page(page=0, search='cricket')
+        labels = ' | '.join(_button_labels(markup))
+        check('search page finds the hidden channel', 'Cricket' in labels, f"got {labels!r}")
+        check('search page offers a way back', 'Clear search' in labels, f"got {labels!r}")
+
+        msg, markup = await bot._get_channels_page(page=0, search='zzzz')
+        check('empty search explains itself', markup is None and 'addchannel' in msg,
+              f"got {msg!r}")
+    finally:
+        bot.monitor, bot.db = saved_monitor, saved_db
+
+
 async def main():
     tests = [
         test_main_installs_an_event_loop,
@@ -692,6 +786,7 @@ async def main():
         test_synonyms_do_not_leak_across_categories,
         test_synonym_order_is_deterministic_and_specific,
         test_singularise_keeps_words_distinct,
+        test_channel_list_is_filtered_to_deal_channels,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

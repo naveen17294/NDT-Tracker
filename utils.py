@@ -66,6 +66,32 @@ def remove_emojis(text):
     return emoji_pattern.sub('', text)
 
 
+def channel_display_name(channel):
+    """Best available human name for a channel row, never empty."""
+    return (
+        channel.get('channel_name')
+        or channel.get('channel_username')
+        or f"Channel {channel.get('channel_id')}"
+    )
+
+
+def channel_matches(channel, terms):
+    """
+    True if any term appears in the channel's title or @username.
+
+    Plain case-insensitive substring, which is what makes 'deal' cover 'deals' and
+    'sale' cover 'sales' without listing every inflection. An empty term list means
+    "no filter" and matches everything.
+    """
+    if not terms:
+        return True
+    haystack = "{} {}".format(
+        channel.get('channel_name') or '',
+        channel.get('channel_username') or '',
+    ).lower()
+    return any(term in haystack for term in terms if term)
+
+
 def format_time_ago(seconds):
     """Format seconds into human-readable 'X ago' string."""
     if seconds < 60:

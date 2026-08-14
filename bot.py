@@ -16,6 +16,7 @@ from keyword_matcher import KeywordMatcher
 from channel_monitor import ChannelMonitor
 from config import (
     BOT_TOKEN,
+    CHANNEL_NAME_FILTERS,
     DEAL_RETENTION_DAYS,
     KEEPALIVE_INTERVAL,
     KEEPALIVE_URL,
@@ -24,7 +25,12 @@ from config import (
     PORT,
     WATCHDOG_INTERVAL,
 )
-from utils import format_time_ago
+from utils import channel_display_name, channel_matches, format_time_ago
+
+# Where the active /searchchannel query is parked, so pagination and toggling stay
+# inside the search results. It cannot ride in callback_data — Telegram caps that at
+# 64 bytes and the query is arbitrary user text.
+_SEARCH_KEY = 'channel_search'
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -92,6 +98,7 @@ Monitoring encrypted channels 24/7 for zero-day drops and flash deals.
 💠 /testmatch `<text>` — Dry-run a message through the matcher
 💠 /synonyms `<keyword>` — Show what a keyword actually matches
 💠 /channels — Uplink to deal channels
+💠 /searchchannel `<text>` — Search every joined channel by name
 💠 /addchannel `<link>` — Manually uplink to a new channel
 💠 /untrackchannel `<name>` — Instantly untrack a specific channel
 💠 /deals — View recent drops
@@ -115,7 +122,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /updatesynonyms `laptop | gaming, macbook, asus` — Updates parameters for an existing target
 
 **2️⃣ Network Uplinks:**
-Use /channels to view available nodes and toggle monitoring.
+Use /channels to view available nodes and toggle monitoring. It lists only channels
+with `deal` or `sale` in the name, plus everything you are already tracking — a
+joined account has hundreds of channels and the rest are noise.
+Use /searchchannel `<text>` to look through *all* joined channels by name.
 Use /addchannel `<username or link>` to manually join and track a new channel.
 
 **3️⃣ Scan Algorithms:**
@@ -295,7 +305,31 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
 
-async def _get_channels_page(page=0):
+def _visible_channels(channels_list, active_ids, search):
+    """
+    Narrow the joined-channel list down to what is worth showing.
+
+    Without this, /channels listed every broadcast channel the account has ever
+    joined — hundreds of them, deal channels buried among news and memes.
+
+    Default view: names containing a CHANNEL_NAME_FILTERS term ('deal', 'sale'),
+    PLUS everything currently tracked regardless of its name. That second half is
+    not optional — a channel added by /addchannel usually will not match the filter,
+    and if the filter hid it you could never toggle it back off.
+
+    Search view: the query alone. Tracked-but-unmatched channels are deliberately
+    left out here; they are always one /channels away.
+    """
+    if search:
+        terms = [search.strip().lower()]
+        return [(cid, info) for cid, info in channels_list if channel_matches(info, terms)]
+    return [
+        (cid, info) for cid, info in channels_list
+        if cid in active_ids or channel_matches(info, CHANNEL_NAME_FILTERS)
+    ]
+
+
+async def _get_channels_page(page=0, search=None):
     joined = await monitor.get_joined_channels()
     db_channels = await db.get_all_channels()
     active_ids = {c['channel_id'] for c in db_channels if c['active'] == 1}
@@ -314,22 +348,40 @@ async def _get_channels_page(page=0):
 
     # Sort channels alphabetically by name
     channels_list = list(all_channels.items())
-    channels_list.sort(key=lambda x: (x[1].get('channel_name') or x[1].get('channel_username') or '').lower())
-    
+    channels_list.sort(key=lambda x: channel_display_name(x[1]).lower())
+
+    visible = _visible_channels(channels_list, active_ids, search)
+
+    if not visible:
+        if search:
+            return (
+                f"🔍 No joined channel matches `{search}`.\n\n"
+                "Try a shorter word, or join it first with "
+                "/addchannel `<username or link>`.",
+                None,
+            )
+        shown = ', '.join(CHANNEL_NAME_FILTERS)
+        return (
+            f"📢 *CHANNELS*\n\n"
+            f"No joined channel has `{shown}` in its name.\n\n"
+            "🔍 /searchchannel `<text>` — look through every joined channel\n"
+            "➕ /addchannel `<username or link>` — join and track a new one",
+            None,
+        )
+
     ITEMS_PER_PAGE = 30
-    total_pages = max(1, (len(channels_list) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    total_pages = max(1, (len(visible) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
-    
+
     start_idx = page * ITEMS_PER_PAGE
     end_idx = start_idx + ITEMS_PER_PAGE
-    current_items = channels_list[start_idx:end_idx]
+    current_items = visible[start_idx:end_idx]
 
     message = f"📢 *MONITORED CHANNELS*\n\n"
-    active_names = []
-    for ch_id, ch_info in channels_list:
-        if ch_id in active_ids:
-            name = ch_info.get('channel_name') or ch_info.get('channel_username') or f"Channel {ch_id}"
-            active_names.append(name)
+    active_names = [
+        channel_display_name(ch_info)
+        for ch_id, ch_info in channels_list if ch_id in active_ids
+    ]
 
     if active_names:
         message += "🟢 **Currently Tracking:**\n"
@@ -340,12 +392,21 @@ async def _get_channels_page(page=0):
     else:
         message += "🔴 Not tracking any channels yet.\n"
 
+    if search:
+        message += f"\n🔍 *Search:* `{search}` — {len(visible)} match(es)\n"
+    else:
+        message += (
+            f"\n🔎 *Showing channels named* `{'`, `'.join(CHANNEL_NAME_FILTERS)}` "
+            f"*— {len(visible)} of {len(channels_list)} joined.*\n"
+            "Use /searchchannel `<text>` for the rest, or /addchannel `<link>` for a new one.\n"
+        )
+
     message += f"\n*Toggle channels below (Page {page+1}/{total_pages}):*\n"
-    
+
     keyboard = []
 
     for ch_id, ch_info in current_items:
-        name = ch_info.get('channel_name') or ch_info.get('channel_username') or f"Channel {ch_id}"
+        name = channel_display_name(ch_info)
         is_active = ch_id in active_ids
         status_emoji = "🟢" if is_active else "🔴"
 
@@ -365,9 +426,13 @@ async def _get_channels_page(page=0):
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page_ch_{page-1}"))
     if page < total_pages - 1:
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_ch_{page+1}"))
-    
+
     if nav_buttons:
         keyboard.append(nav_buttons)
+
+    if search:
+        keyboard.append([InlineKeyboardButton(
+            "❎ Clear search", callback_data="ch_clear_search")])
 
     # Untrack All button
     if active_ids:
@@ -378,10 +443,12 @@ async def _get_channels_page(page=0):
 
 @owner_only
 async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show channel selection menu."""
+    """Show channel selection menu, filtered to deal/sale channels."""
     if not monitor:
         await update.message.reply_text("⏳ Channel monitor loading, please try again in a moment.")
         return
+
+    context.user_data.pop(_SEARCH_KEY, None)  # /channels always leaves search mode
 
     try:
         message, reply_markup = await _get_channels_page(page=0)
@@ -389,6 +456,30 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error listing channels: {e}")
         await update.message.reply_text(f"❌ Error listing channels: {str(e)}")
+
+
+@owner_only
+async def search_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search every joined channel by name, ignoring the deal/sale filter."""
+    if not monitor:
+        await update.message.reply_text("⏳ Channel monitor loading, please try again in a moment.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ What should I search for?\nExample: `/searchchannel loot`",
+            parse_mode='Markdown')
+        return
+
+    query = ' '.join(context.args).strip()
+    context.user_data[_SEARCH_KEY] = query
+
+    try:
+        message, reply_markup = await _get_channels_page(page=0, search=query)
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error searching channels: {e}")
+        await update.message.reply_text(f"❌ Error searching channels: {str(e)}")
 
 
 @owner_only
@@ -542,31 +633,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await monitor.refresh_channels()
 
         try:
-            msg, markup = await _get_channels_page(page)
+            # Re-render the view the button was pressed in, search included.
+            msg, markup = await _get_channels_page(page, context.user_data.get(_SEARCH_KEY))
             await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Error updating channels message: {e}")
             await query.edit_message_text("❌ Error updating channels.")
-            
+
     # Untrack all channels callback
     elif data == 'untrack_all_channels':
         await db.untrack_all_channels()
         if monitor:
             await monitor.refresh_channels()
-            
+
         try:
-            msg, markup = await _get_channels_page(0)
+            msg, markup = await _get_channels_page(0, context.user_data.get(_SEARCH_KEY))
             await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
             await query.answer("🛑 Untracked all channels!")
         except Exception as e:
             logger.error(f"Error untracking all channels: {e}")
             await query.edit_message_text("❌ Error untracking channels.")
-            
+
+    # Leave search mode, back to the deal/sale list
+    elif data == 'ch_clear_search':
+        context.user_data.pop(_SEARCH_KEY, None)
+        try:
+            msg, markup = await _get_channels_page(0)
+            await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Error clearing channel search: {e}")
+            await query.edit_message_text("❌ Error clearing search.")
+
     # Pagination callback
     elif data.startswith('page_ch_'):
         page = int(data.replace('page_ch_', ''))
         try:
-            msg, markup = await _get_channels_page(page)
+            msg, markup = await _get_channels_page(page, context.user_data.get(_SEARCH_KEY))
             await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Error paging channels: {e}")
@@ -693,6 +795,7 @@ async def post_init(application):
         BotCommand("testmatch", "Test if a message would trigger an alert"),
         BotCommand("synonyms", "Show what terms a keyword matches"),
         BotCommand("channels", "Select channels to monitor"),
+        BotCommand("searchchannel", "Search all joined channels by name"),
         BotCommand("addchannel", "Join & track a new channel"),
         BotCommand("untrackchannel", "Untrack a specific channel"),
         BotCommand("deals", "View recent matched deals"),
@@ -789,6 +892,7 @@ def main():
     application.add_handler(CommandHandler("testmatch", testmatch_command))
     application.add_handler(CommandHandler("synonyms", synonyms_command))
     application.add_handler(CommandHandler("channels", channels_command))
+    application.add_handler(CommandHandler("searchchannel", search_channel_command))
     application.add_handler(CommandHandler("addchannel", add_channel_command))
     application.add_handler(CommandHandler("untrackchannel", untrack_channel_command))
     application.add_handler(CommandHandler("deals", deals_command))

@@ -18,7 +18,7 @@ deduplicate → alert.
 ## Commands
 
 `/watch` `/unwatch` `/updatesynonyms` `/watchlist` — keywords.
-`/channels` `/addchannel` `/untrackchannel` — sources.
+`/channels` `/searchchannel` `/addchannel` `/untrackchannel` — sources.
 `/deals` `/stats` `/pause` `/resume` — status.
 `/testmatch <text>` `/synonyms <keyword>` — **debug matching**; reach for these
 first, since a wrong match is indistinguishable from a right one from outside.
@@ -73,7 +73,24 @@ Alerts show which stage won (`PREVIEW_NATIVE` / `PREVIEW_API` / `LINK_SCRAPE` /
 > newer ones wrap it in `messages.WebPagePreview` with `.media`. Both are handled so
 > a layer bump can't break previews again.
 
-## 3. Price, dedup, alerts
+## 3. Channel discovery (`bot.py`)
+
+`/channels` shows only joined channels whose title or @username contains a
+`CHANNEL_NAME_FILTERS` term (`deal`, `sale` — substrings, so `deals`/`sales` are
+covered). A real account has joined hundreds of channels and the unfiltered list was
+pages of news and memes. `/searchchannel <text>` ignores the filter; `/addchannel`
+never consulted it.
+
+> ⚠️ **Tracked channels are listed even when the name does not match.** Dropping that
+> exception makes a channel added via `/addchannel` — which usually won't contain
+> "deal" — permanently untoggleable, because the filter hides the only button that
+> could turn it off. `_visible_channels()` is the one place this rule lives.
+
+The active search query is parked in `context.user_data`, not `callback_data`:
+Telegram caps callback payloads at 64 bytes and the query is arbitrary user text.
+Toggling and paging re-render whatever view the button was pressed in.
+
+## 4. Price, dedup, alerts
 
 Prices use `[\d,]+` so `₹1,000` isn't truncated, and catch a bare number beside a
 link (`2950 : https://...`). Dedup hashes **cleaned product name + price + keyword**,
@@ -81,7 +98,7 @@ not raw text, so the same deal reposted with a new affiliate link is dropped.
 Alerts are HTML (not MarkdownV2) with `html.escape()`, so odd characters can't
 break delivery.
 
-## 4. Persistence
+## 5. Persistence
 
 `storage.py` picks a backend from `DATABASE_URL`: Postgres when set, SQLite
 otherwise. `database.py`'s API is identical either way. Postgres exists because a
@@ -107,7 +124,7 @@ Rules when touching SQL — it is written once in `?` style and translated to `$
 Tools: `check_db.py` (verify a database before deploying), `migrate_to_postgres.py`
 (copy an existing SQLite file across; idempotent, deletes nothing).
 
-## 5. Memory management
+## 6. Memory management
 
 Long-lived process on a small container — anything per-message compounds.
 
@@ -124,7 +141,7 @@ Long-lived process on a small container — anything per-message compounds.
 - One shared `aiohttp.ClientSession` (was a new TLS context per URL), page reads
   capped via streaming, `soup.decompose()` to break BeautifulSoup's cycles.
 
-## 6. Startup
+## 7. Startup
 
 > ⚠️ **`main()`'s `asyncio.set_event_loop()` block looks like dead code and is not.**
 > python-telegram-bot 21.x calls `asyncio.get_event_loop()` inside `run_polling()`.

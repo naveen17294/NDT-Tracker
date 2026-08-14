@@ -60,6 +60,7 @@ In order — this isolates failures instead of guessing:
 | `Port scan timeout reached` | Something slow ran before the web server bound. It must bind first |
 | Watchlist empty after a restart | On SQLite, not Postgres. Check for `backend=postgres` in the logs |
 | Bot answers but never alerts | `telethon_connected: false`, or no channels selected — run `/channels` |
+| A channel you joined is missing from `/channels` | Its name has no `deal`/`sale` in it. Find it with `/searchchannel <text>`, or widen `CHANNEL_NAME_FILTERS` |
 | `retry 1/2` then success in logs | Normal. Neon suspends when idle and briefly refuses the first connection while waking |
 | `👋 NDT shut down cleanly` | Normal. Every deploy and restart logs this. A real failure shows a traceback |
 

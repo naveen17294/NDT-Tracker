@@ -13,7 +13,9 @@ Release history: `CHANGELOG.md`.
 ## Features
 
 - **Channel monitoring** — a Telethon user client listens to channels you've
-  joined; `/channels` toggles which ones are watched.
+  joined; `/channels` toggles which ones are watched. It lists only channels with
+  `deal` or `sale` in the name, since a real account has joined hundreds;
+  `/searchchannel` reaches the rest and `/addchannel` joins a new one.
 - **Synonym matching** — built-in dictionary across ~40 Indian e-commerce
   categories (`fridge` → `refrigerator`, `double door`, …), plus custom synonyms
   and singular/plural handling.

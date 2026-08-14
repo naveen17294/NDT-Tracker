@@ -138,6 +138,28 @@ FUZZY_MAX_LENGTH_DIFF = _env_int('FUZZY_MAX_LENGTH_DIFF', 2)
 # incoming channel message. Cache it in memory for this many seconds.
 WATCHLIST_CACHE_TTL = _env_int('WATCHLIST_CACHE_TTL', 30)
 
+# ── Channel discovery (/channels) ──
+#
+# A real Telegram account has joined hundreds of broadcast channels, and /channels
+# used to list every single one — pages of news, memes and group announcements to
+# scroll past before reaching a deal channel. Only channels whose title or @username
+# contains one of these terms are offered.
+#
+# These are plain substrings, so 'deal' also covers 'deals' and 'sale' covers
+# 'sales' / 'wholesale'. Widen the net with the env var, comma-separated:
+#   CHANNEL_NAME_FILTERS=deal,sale,offer,loot,discount
+#
+# Two deliberate escape hatches, because a filter that hides things needs them:
+#   * channels you are already tracking are ALWAYS listed, even if the name does not
+#     match — otherwise you could end up tracking something you cannot see to untrack;
+#   * /searchchannel and /addchannel ignore the filter entirely.
+CHANNEL_NAME_FILTERS = [
+    term for term in (
+        part.strip().lower()
+        for part in os.getenv('CHANNEL_NAME_FILTERS', 'deal,sale').split(',')
+    ) if term
+]
+
 # ── Deduplication & Retention ──
 DEDUP_HOURS = _env_int('DEDUP_HOURS', 24)   # Don't re-notify same deal within this window
 NOTIFIER_DEDUP_WINDOW = _env_int('NOTIFIER_DEDUP_WINDOW', 300)  # in-memory alert suppression
