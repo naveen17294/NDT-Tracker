@@ -5,12 +5,23 @@ import logging
 import re
 import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    BotCommand,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from database import Database
 from keyword_matcher import KeywordMatcher, parse_exclusions
@@ -87,77 +98,196 @@ def _invalidate_watchlist():
         monitor.invalidate_watchlist_cache()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Ask-for-input flow
+#
+#  Tapping a command in Telegram's menu sends it BARE — there is no way to
+#  make the client pre-fill "/watch " and wait for you to type the rest. So
+#  every command that needs an argument used to answer a menu tap with
+#  "❌ Please specify a keyword", which is the whole reason the bot felt
+#  unusable from the menu.
+#
+#  Instead, a bare command now ASKS. ForceReply pops the keyboard open with
+#  the question quoted and a placeholder in the input box, and the next
+#  message the user sends is consumed as that command's argument. Typing
+#  `/watch shoes` in one go still works exactly as before.
+# ══════════════════════════════════════════════════════════════════════
+
+_PENDING_KEY = 'pending_prompt'
+
+# action -> (question, input-box placeholder, extra help shown under the question)
+_PROMPTS = {
+    'watch': (
+        '➕ What should I watch for?',
+        'shoes',
+        'Just a keyword — or <code>shoes -kids</code> to block terms, '
+        '<code>laptop | gaming, macbook</code> to add synonyms.',
+    ),
+    'unwatch': ('➖ Which keyword should I drop?', 'shoes', ''),
+    'synonyms': ('🔍 Which keyword?', 'shoes', ''),
+    'updatesynonyms': (
+        '💡 New synonyms',
+        'laptop | gaming, macbook',
+        'Format: <code>keyword | synonym1, synonym2</code>',
+    ),
+    'exclude': (
+        '🚫 Terms to block',
+        'shoes | kids, women',
+        'Format: <code>keyword | term1, term2</code>. Send <code>keyword |</code> to clear.',
+    ),
+    'exclude_terms': (
+        '🚫 Terms to block for <code>{keyword}</code>',
+        'kids, women, socks',
+        'Comma-separated. Send <code>-</code> to clear them.',
+    ),
+    'testmatch': (
+        '🧪 Paste a message to test',
+        'Nike Running Shoes Rs 1999',
+        "I'll tell you whether it would alert, and why.",
+    ),
+    'addchannel': (
+        '➕ Channel username or link',
+        '@dealschannel',
+        'Also accepts <code>https://t.me/dealschannel</code>.',
+    ),
+    'untrackchannel': ('🛑 Which channel should I untrack?', 'dealschannel', ''),
+    'searchchannel': (
+        '🔍 Search joined channels for',
+        'loot',
+        'Searches every joined channel, not just deal/sale ones.',
+    ),
+}
+
+
+async def _prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, action, **data):
+    """Ask for a command's missing argument and remember what it was for."""
+    question, placeholder, hint = _PROMPTS[action]
+    # Values land inside the question text, and a keyword is arbitrary user input.
+    question = question.format(**{k: html.escape(str(v)) for k, v in data.items()})
+    context.user_data[_PENDING_KEY] = dict(action=action, **data)
+
+    body = question
+    if hint:
+        body += f"\n\n{hint}"
+    body += "\n\n<i>Send /cancel to stop.</i>"
+
+    await update.effective_message.reply_text(
+        body,
+        parse_mode='HTML',
+        reply_markup=ForceReply(input_field_placeholder=placeholder[:64]),
+    )
+
+
+@owner_only
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abandon whatever the bot was waiting for."""
+    pending = context.user_data.pop(_PENDING_KEY, None)
+    if pending:
+        await update.message.reply_text(
+            f"🚫 Cancelled.", reply_markup=_quick_keyboard())
+    else:
+        await update.message.reply_text(
+            "Nothing to cancel.", reply_markup=_quick_keyboard())
+
+
+@owner_only
+async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle a plain (non-command) message.
+
+    Two jobs: run a quick-keyboard button, or feed the answer to whatever question
+    the bot last asked. Anything else gets a nudge rather than silence — an
+    unacknowledged message reads as a broken bot.
+    """
+    text = (update.message.text or '').strip()
+    if not text:
+        return
+
+    action = _QUICK_ACTIONS.get(text)
+    if action:
+        # A quick-keyboard tap abandons any half-finished question.
+        context.user_data.pop(_PENDING_KEY, None)
+        await action(update, context)
+        return
+
+    pending = context.user_data.pop(_PENDING_KEY, None)
+    if not pending:
+        await update.message.reply_text(
+            "🤔 I'm not expecting anything right now.\n"
+            "Tap ☰ Menu below, or /help for what I can do.",
+            reply_markup=_quick_keyboard())
+        return
+
+    applier = _APPLIERS[pending['action']]
+    await applier(update, context, text, **{k: v for k, v in pending.items()
+                                            if k != 'action'})
+
+
+@owner_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - Welcome & Intro."""
-    welcome = """
-╔════════════════════════════╗
-      ⚡ **N D T   N E X U S** ⚡
+    welcome = """╔════════════════════════════╗
+      ⚡ <b>N D T   N E X U S</b> ⚡
 ╚════════════════════════════╝
 
-💠 **SYSTEM ONLINE** 💠
-Your Personal Deal Tracker is now active.
-Monitoring encrypted channels 24/7 for zero-day drops and flash deals.
+💠 <b>SYSTEM ONLINE</b> 💠
+Your personal deal tracker is watching your channels 24/7.
 
-**Terminal Commands:**
-💠 /watch `<keyword>` — Track a new target
-💠 /unwatch `<keyword>` — Drop a target
-💠 /updatesynonyms `<keyword> | <synonyms>` — Update synonyms for a target
-💠 /exclude `<keyword> | <terms>` — Block terms for a target
-💠 /watchlist — View active tracking matrix
-💠 /testmatch `<text>` — Dry-run a message through the matcher
-💠 /synonyms `<keyword>` — Show what a keyword actually matches
-💠 /channels — Uplink to deal channels
-💠 /searchchannel `<text>` — Search every joined channel by name
-💠 /addchannel `<link>` — Manually uplink to a new channel
-💠 /untrackchannel `<name>` — Instantly untrack a specific channel
-💠 /channelreport — Which nodes are earning their place
-💠 /deals — View recent drops
-💠 /pause or /resume — Suspend/Resume scans
-💠 /stats — System diagnostics
-💠 /help — Access manual
+<b>Three things to get going:</b>
+1️⃣ /watch — tell me what to look for
+2️⃣ /channels — pick the channels to watch
+3️⃣ Wait. Rate alerts with 👍/👎 so I learn which channels are worth it.
 
-*Awaiting input...* 📟
-    """
-    await update.message.reply_text(welcome, parse_mode='Markdown')
+Every command works bare — send /watch with nothing and I'll ask.
+Buttons below, or ☰ /menu for everything. /help for the manual."""
+    await update.message.reply_text(
+        welcome, parse_mode='HTML', reply_markup=_quick_keyboard())
+    is_paused = monitor.paused if monitor else True
+    await update.message.reply_text(
+        _menu_text(is_paused), parse_mode='HTML',
+        reply_markup=_menu_markup(is_paused))
+
+
+HELP_TEXT = """📖 <b>N D T   M A N U A L</b>
+
+<i>You never have to remember an argument.</i> Send any command bare — /watch, /exclude,
+/testmatch — and NDT asks for what it needs. /cancel backs out. ☰ /menu does the
+whole thing with buttons.
+
+<b>1️⃣ Targets</b>
+/watch <code>fridge</code> — also matches "refrigerator", "double door", …
+/watch <code>laptop | gaming, macbook</code> — adds your own synonyms
+/watch <code>shoes -kids -women</code> — blocks terms while adding
+/exclude <code>shoes | kids, women</code> — blocks terms on an existing target.
+A message containing a blocked term never alerts for that keyword, even if it
+matches otherwise. Send <code>shoes |</code> to clear.
+/testmatch <code>&lt;message&gt;</code> — dry-run before waiting on a real deal. It says which
+keyword matched, or which blocked term vetoed it.
+
+<b>2️⃣ Channels</b>
+/channels — toggle monitoring. Lists only channels with <code>deal</code> or <code>sale</code> in the
+name, plus everything you already track; a joined account has hundreds and the
+rest are noise.
+/searchchannel <code>&lt;text&gt;</code> — reaches every joined channel.
+/addchannel <code>&lt;@name or link&gt;</code> — join and track a new one.
+
+<b>3️⃣ Rate your alerts</b>
+Every alert carries 👍/👎. One tap says whether that channel is worth keeping —
+it feeds /channelreport, which also arrives on its own every 8 hours. Nothing
+about the alert itself is stored, only per-channel tallies.
+
+<b>4️⃣ Control</b>
+/pause · /resume · /stats · /keyboard <code>on|off</code>
+
+<i>System ready.</i> ⚡"""
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command."""
-    help_text = """
-📖 **N D T   M A N U A L**
-
-**1️⃣ Add Targets:**
-/watch `fridge` — Tracks "fridge", "refrigerator", "double door", etc.
-/watch `laptop | gaming, macbook` — Adds custom parameters
-/watch `shoes -kids -women` — Blocks terms while adding
-/updatesynonyms `laptop | gaming, macbook, asus` — Updates parameters for an existing target
-/exclude `shoes | kids, women, socks` — Blocks terms on an existing target.
-A message containing any blocked term never alerts for that keyword, even if it
-matches otherwise. `/exclude shoes |` clears them.
-
-**Rate your alerts:** every alert carries 👍/👎. One tap tells NDT whether that
-channel is worth keeping — it feeds /channelreport, which arrives every 8 hours.
-Nothing about the alert itself is stored; only per-channel tallies.
-
-**2️⃣ Network Uplinks:**
-Use /channels to view available nodes and toggle monitoring. It lists only channels
-with `deal` or `sale` in the name, plus everything you are already tracking — a
-joined account has hundreds of channels and the rest are noise.
-Use /searchchannel `<text>` to look through *all* joined channels by name.
-Use /addchannel `<username or link>` to manually join and track a new channel.
-
-**3️⃣ Scan Algorithms:**
-💠 **Text Parse:** Deep scans message packets for target matches.
-💠 **Link Trace:** Extracts metadata from shortened URLs (`amzn.to`, etc.) when text is masked.
-💠 **Price Rip:** Extracts numeric values directly from payload.
-
-**4️⃣ System Control:**
-💠 /pause — Suspend all active scans
-💠 /resume — Re-engage scanning
-
-*System ready. Input target.* ⚡
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.effective_message.reply_text(
+        HELP_TEXT, parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('☰ Menu', callback_data='menu_home')]]))
 
 
 # Matches a standalone -term, e.g. the "-kids" in "/watch shoes -kids". The
@@ -177,18 +307,14 @@ def parse_negatives(text):
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add keyword to watchlist."""
     if not context.args:
-        await update.message.reply_text(
-            "❌ Please specify a keyword.\n"
-            "Example: `/watch fridge`, `/watch laptop | gaming, macbook`,\n"
-            "or `/watch shoes -kids -women` to block terms.",
-            parse_mode='Markdown'
-        )
+        await _prompt(update, context, 'watch')
         return
+    await _apply_watch(update, context, ' '.join(context.args))
 
-    full_arg = ' '.join(context.args)
 
+async def _apply_watch(update, context, text):
     # Negative keywords first, so a '-term' can sit anywhere in the argument.
-    full_arg, exclusions = parse_negatives(full_arg)
+    full_arg, exclusions = parse_negatives(text)
 
     # Check for custom synonyms (separated by |)
     if '|' in full_arg:
@@ -200,10 +326,10 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         custom_synonyms = ''
 
     if not keyword:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ That's only exclusions — I need a keyword too.\n"
-            "Example: `/watch shoes -kids`",
-            parse_mode='Markdown')
+            "Example: <code>shoes -kids</code>",
+            parse_mode='HTML')
         return
 
     success = await db.add_keyword(keyword, custom_synonyms, exclusions)
@@ -211,15 +337,28 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         _invalidate_watchlist()
         syns = matcher.get_display_synonyms(keyword, custom_synonyms)
-        syn_text = f"\n💡 *Synonyms included:* {', '.join(syns)}" if syns else ""
-        excl_text = f"\n🚫 *Blocked terms:* {exclusions}" if exclusions else ""
-        await update.message.reply_text(
-            f"✅ *Added to watchlist:* `{keyword}`{syn_text}{excl_text}\n\n"
-            f"NDT will notify you when deals appear in your monitored channels!",
-            parse_mode='Markdown'
+        syn_text = (f"\n💡 <b>Synonyms included:</b> {html.escape(', '.join(syns))}"
+                    if syns else "")
+        excl_text = (f"\n🚫 <b>Blocked terms:</b> {html.escape(exclusions)}"
+                     if exclusions else "")
+        await update.effective_message.reply_text(
+            f"✅ <b>Now watching:</b> <code>{html.escape(keyword)}</code>"
+            f"{syn_text}{excl_text}",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('🚫 Block terms', callback_data=f'exc_kw_{keyword}'),
+                InlineKeyboardButton('📋 Watchlist', callback_data='menu_watchlist'),
+            ]]) if _fits_callback(f'exc_kw_{keyword}') else None,
         )
     else:
-        await update.message.reply_text(f"⚠️ `{keyword}` is already on your watchlist.\n\nUse `/updatesynonyms {keyword} | new, synonyms` to update it.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"⚠️ <code>{html.escape(keyword)}</code> is already on your watchlist.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('💡 Synonyms', callback_data=f'syn_kw_{keyword}'),
+                InlineKeyboardButton('🚫 Block terms', callback_data=f'exc_kw_{keyword}'),
+            ]]) if _fits_callback(f'syn_kw_{keyword}') else None,
+        )
 
 
 @owner_only
@@ -227,53 +366,74 @@ async def exclude_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the negative keywords for an existing watchlist entry."""
     full_arg = ' '.join(context.args) if context.args else ''
 
+    if not full_arg:
+        # No argument: offer the watchlist as buttons rather than making the user
+        # remember and retype a keyword.
+        await _pick_keyword(update, context, 'exc_kw_',
+                            '🚫 Block terms for which keyword?')
+        return
+
     if '|' not in full_arg:
-        await update.message.reply_text(
-            "❌ Format: `/exclude <keyword> | <terms>`\n"
-            "Example: `/exclude shoes | kids, women, socks`\n"
-            "Clear them with `/exclude shoes |`",
-            parse_mode='Markdown')
+        await _prompt(update, context, 'exclude')
         return
 
-    keyword, exclusions = (part.strip() for part in full_arg.split('|', 1))
+    await _apply_exclude(update, context, full_arg)
+
+
+async def _apply_exclude(update, context, text):
+    keyword, exclusions = (part.strip() for part in text.split('|', 1))
     if not keyword:
-        await update.message.reply_text("❌ Which keyword?", parse_mode='Markdown')
+        await update.effective_message.reply_text("❌ Which keyword?")
         return
+    await _set_exclusions(update, context, keyword, exclusions)
 
+
+async def _apply_exclude_terms(update, context, text, keyword=''):
+    """Second half of the button flow: the keyword is known, this is the term list."""
+    await _set_exclusions(update, context, keyword,
+                          '' if text.strip() == '-' else text)
+
+
+async def _set_exclusions(update, context, keyword, exclusions):
     if not await db.update_exclusions(keyword, exclusions):
-        await update.message.reply_text(
-            f"❌ `{keyword}` is not on your watchlist. Add it with `/watch` first.",
-            parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"❌ <code>{html.escape(keyword)}</code> is not on your watchlist. "
+            f"Add it with /watch first.", parse_mode='HTML')
         return
 
     _invalidate_watchlist()
     if exclusions:
-        await update.message.reply_text(
-            f"🚫 *Blocked for* `{keyword}`*:* {exclusions}\n\n"
-            f"A message containing any of those will no longer alert for this keyword.\n"
-            f"Check it with `/testmatch <some message>`.",
-            parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"🚫 <b>Blocked for</b> <code>{html.escape(keyword)}</code>: "
+            f"{html.escape(exclusions)}\n\n"
+            f"A message containing any of those will no longer alert for this keyword.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('🧪 Test a message', callback_data='ask_testmatch'),
+                InlineKeyboardButton('📋 Watchlist', callback_data='menu_watchlist'),
+            ]]))
     else:
-        await update.message.reply_text(
-            f"✅ Cleared all blocked terms for `{keyword}`.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"✅ Cleared all blocked terms for <code>{html.escape(keyword)}</code>.",
+            parse_mode='HTML')
 
 @owner_only
 async def update_synonyms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Update custom synonyms for an existing keyword."""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Please specify a keyword and new synonyms.\n"
-            "Example: `/updatesynonyms laptop | gaming, macbook, asus`",
-            parse_mode='Markdown'
-        )
+    full_arg = ' '.join(context.args) if context.args else ''
+    if '|' not in full_arg:
+        await _prompt(update, context, 'updatesynonyms')
+        return
+    await _apply_update_synonyms(update, context, full_arg)
+
+
+async def _apply_update_synonyms(update, context, text):
+    if '|' not in text:
+        await update.effective_message.reply_text(
+            "❌ Format: <code>keyword | synonym1, synonym2</code>", parse_mode='HTML')
         return
 
-    full_arg = ' '.join(context.args)
-    if '|' not in full_arg:
-        await update.message.reply_text("❌ Please format as: `/updatesynonyms keyword | synonym1, synonym2`", parse_mode='Markdown')
-        return
-        
-    parts = full_arg.split('|', 1)
+    parts = text.split('|', 1)
     keyword = parts[0].strip()
     custom_synonyms = parts[1].strip()
 
@@ -283,49 +443,61 @@ async def update_synonyms_command(update: Update, context: ContextTypes.DEFAULT_
         _invalidate_watchlist()
         syns = matcher.get_display_synonyms(keyword, custom_synonyms)
         syn_text = f"\n💡 *New Synonyms:* {', '.join(syns)}" if syns else ""
-        await update.message.reply_text(
-            f"✅ *Updated synonyms for:* `{keyword}`{syn_text}",
-            parse_mode='Markdown'
+        await update.effective_message.reply_text(
+            f"✅ <b>Updated synonyms for:</b> <code>{html.escape(keyword)}</code>{syn_text}",
+            parse_mode='HTML'
         )
     else:
-        await update.message.reply_text(f"❌ `{keyword}` was not found in your watchlist. Add it with `/watch` first.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"❌ <code>{html.escape(keyword)}</code> was not found in your watchlist. "
+            f"Add it with /watch first.", parse_mode='HTML')
+
 
 @owner_only
 async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove keyword from watchlist."""
     if not context.args:
-        await update.message.reply_text("❌ Please specify a keyword to remove. Example: `/unwatch fridge`", parse_mode='Markdown')
+        await _pick_keyword(update, context, 'del_kw_', '➖ Which keyword should I drop?')
         return
+    await _apply_unwatch(update, context, ' '.join(context.args))
 
-    keyword = ' '.join(context.args).strip()
+
+async def _apply_unwatch(update, context, text):
+    keyword = text.strip()
     success = await db.remove_keyword(keyword)
 
     if success:
         _invalidate_watchlist()
-        await update.message.reply_text(f"🗑️ Removed `{keyword}` from watchlist.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"🗑️ Removed <code>{html.escape(keyword)}</code> from watchlist.",
+            parse_mode='HTML')
     else:
-        await update.message.reply_text(f"❌ `{keyword}` was not found in your watchlist.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"❌ <code>{html.escape(keyword)}</code> was not found in your watchlist.",
+            parse_mode='HTML')
 
 
 @owner_only
 async def testmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Dry-run the matcher against a message, without waiting for a real deal."""
     if not context.args:
-        await update.message.reply_text(
-            "❌ Paste a message to test.\n"
-            "Example: `/testmatch Nike Running Shoes Rs 1999`",
-            parse_mode='Markdown'
-        )
+        await _prompt(update, context, 'testmatch')
         return
+    await _apply_testmatch(update, context, ' '.join(context.args))
 
-    text = ' '.join(context.args)
+
+async def _apply_testmatch(update, context, text):
     watchlist = await db.get_all_keywords()
     report, result = matcher.explain(text, watchlist)
 
     verdict = "✅ WOULD ALERT" if result else "🚫 WOULD NOT ALERT"
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"<b>{verdict}</b>\n\n<pre>{html.escape(report)}</pre>",
-        parse_mode='HTML'
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('🧪 Test another', callback_data='ask_testmatch'),
+            InlineKeyboardButton('📋 Watchlist', callback_data='menu_watchlist'),
+        ]]),
     )
 
 
@@ -333,13 +505,13 @@ async def testmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def synonyms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show exactly what terms a keyword expands to."""
     if not context.args:
-        await update.message.reply_text(
-            "❌ Specify a keyword.\nExample: `/synonyms shoes`",
-            parse_mode='Markdown'
-        )
+        await _pick_keyword(update, context, 'syn_kw_', '💡 Show synonyms for which keyword?')
         return
+    await _apply_synonyms(update, context, ' '.join(context.args))
 
-    keyword = ' '.join(context.args).strip()
+
+async def _apply_synonyms(update, context, text):
+    keyword = text.strip()
     rows = await db.get_watchlist()
     custom = ''
     excluded = ''
@@ -357,41 +529,122 @@ async def synonyms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         blocked = (f"\n\n🚫 Blocked — a message containing any of these will not "
                    f"alert for <b>{html.escape(keyword)}</b>:\n"
                    f"<pre>{html.escape(blocked_list)}</pre>")
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"<b>{html.escape(keyword)}</b> matches {len(terms)} term(s):\n\n"
         f"<pre>{html.escape(listed)}</pre>{blocked}",
-        parse_mode='HTML'
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('🚫 Block terms', callback_data=f'exc_kw_{keyword}'),
+            InlineKeyboardButton('📋 Watchlist', callback_data='menu_watchlist'),
+        ]]) if _fits_callback(f'exc_kw_{keyword}') else None,
     )
 
 
-@owner_only
-async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display and manage watchlist."""
+def _fits_callback(data):
+    """Telegram rejects callback_data over 64 bytes — a long keyword would 400."""
+    return len(data.encode()) <= 64
+
+
+# Every view renderer returns (text, markup) and every view is HTML. Sending them
+# through these two helpers is what keeps that true: the parse mode is not a
+# per-call-site decision, so a renderer converted to HTML cannot be left with a
+# caller still claiming Markdown — which is a hard 400 from Telegram, i.e. the
+# screen simply fails to appear.
+async def _reply_view(update, view):
+    text, markup = view
+    return await update.effective_message.reply_text(
+        text, reply_markup=markup, parse_mode='HTML',
+        disable_web_page_preview=True)
+
+
+async def _edit_view(query, view):
+    text, markup = view
+    return await query.edit_message_text(
+        text, reply_markup=markup, parse_mode='HTML',
+        disable_web_page_preview=True)
+
+
+async def _pick_keyword(update, context, prefix, title):
+    """
+    Offer the watchlist as buttons instead of asking the user to retype a keyword.
+
+    Used wherever a command's argument is "one of your existing keywords" —
+    /unwatch, /synonyms, /exclude. Keywords too long to fit in callback_data fall
+    back to being typed.
+    """
+    items = await db.get_watchlist()
+    if not items:
+        await update.effective_message.reply_text(
+            "📋 Your watchlist is empty.\n\nAdd something with /watch first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('➕ Add a keyword', callback_data='ask_watch')]]))
+        return
+
+    keyboard, overflow = [], []
+    for item in items:
+        kw = item['keyword']
+        if _fits_callback(f"{prefix}{kw}"):
+            keyboard.append([InlineKeyboardButton(kw, callback_data=f"{prefix}{kw}")])
+        else:
+            overflow.append(kw)
+
+    note = ''
+    if overflow:
+        note = ("\n\n<i>Too long to show as buttons: "
+                + html.escape(', '.join(overflow)) + "</i>")
+
+    await update.effective_message.reply_text(
+        f"{title}{note}", parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+
+async def _render_watchlist():
+    """
+    The watchlist view, shared by the command and the menu button.
+
+    HTML, not Markdown — see the note on _render_deals. A keyword like `iphone_15`
+    is enough to make Telegram reject a Markdown message outright.
+    """
     items = await db.get_watchlist()
 
     if not items:
-        await update.message.reply_text(
-            "📋 *Your Watchlist is empty!*\n\nAdd products using `/watch <keyword>`",
-            parse_mode='Markdown'
-        )
-        return
+        return ("📋 <b>Your watchlist is empty.</b>\n\nTap below to add your first keyword.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton('➕ Add a keyword', callback_data='ask_watch')]]))
 
-    message = "📋 *YOUR WATCHLIST*\n\n"
+    message = f"📋 <b>YOUR WATCHLIST</b> ({len(items)})\n\n"
     keyboard = []
 
     for item in items:
         kw = item['keyword']
         syns = matcher.get_display_synonyms(kw, item.get('custom_synonyms', ''))
-        syn_preview = f" ({', '.join(syns[:3])})" if syns else ""
+        syn_preview = f" ({html.escape(', '.join(syns[:3]))})" if syns else ""
         excluded = item.get('exclusions') or ''
-        excl_preview = f"\n   🚫 {excluded}" if excluded else ""
-        message += f"• `{kw}`{syn_preview}{excl_preview}\n"
+        excl_preview = f"\n   🚫 blocked: {html.escape(excluded)}" if excluded else ""
+        message += f"• <code>{html.escape(kw)}</code>{syn_preview}{excl_preview}\n"
 
-        # Add delete button for each keyword
-        keyboard.append([InlineKeyboardButton(f"❌ Delete '{kw}'", callback_data=f"del_kw_{kw}")])
+        # Per-keyword actions. Delete used to be the only one, which meant editing a
+        # keyword's synonyms or exclusions required retyping it from memory.
+        if _fits_callback(f"exc_kw_{kw}"):
+            keyboard.append([
+                InlineKeyboardButton(f"🚫 {kw[:14]}", callback_data=f"exc_kw_{kw}"),
+                InlineKeyboardButton(f"💡 {kw[:14]}", callback_data=f"syn_kw_{kw}"),
+                InlineKeyboardButton("❌", callback_data=f"del_kw_{kw}"),
+            ])
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    keyboard.append([
+        InlineKeyboardButton('➕ Add', callback_data='ask_watch'),
+        InlineKeyboardButton('🧪 Test a message', callback_data='ask_testmatch'),
+    ])
+    keyboard.append([InlineKeyboardButton('« Menu', callback_data='menu_home')])
+
+    return message, InlineKeyboardMarkup(keyboard)
+
+
+@owner_only
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display and manage watchlist."""
+    await _reply_view(update, await _render_watchlist())
 
 
 def _visible_channels(channels_list, active_ids, search):
@@ -442,20 +695,22 @@ async def _get_channels_page(page=0, search=None):
     visible = _visible_channels(channels_list, active_ids, search)
 
     if not visible:
+        back = InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔍 Search all', callback_data='ask_searchchannel'),
+             InlineKeyboardButton('➕ Add channel', callback_data='ask_addchannel')],
+            [InlineKeyboardButton('« Menu', callback_data='menu_home')],
+        ])
         if search:
             return (
-                f"🔍 No joined channel matches `{search}`.\n\n"
-                "Try a shorter word, or join it first with "
-                "/addchannel `<username or link>`.",
-                None,
+                f"🔍 No joined channel matches <code>{html.escape(search)}</code>.\n\n"
+                "Try a shorter word, or join it directly.",
+                back,
             )
-        shown = ', '.join(CHANNEL_NAME_FILTERS)
+        shown = html.escape(', '.join(CHANNEL_NAME_FILTERS))
         return (
-            f"📢 *CHANNELS*\n\n"
-            f"No joined channel has `{shown}` in its name.\n\n"
-            "🔍 /searchchannel `<text>` — look through every joined channel\n"
-            "➕ /addchannel `<username or link>` — join and track a new one",
-            None,
+            f"📢 <b>CHANNELS</b>\n\n"
+            f"No joined channel has <code>{shown}</code> in its name.",
+            back,
         )
 
     ITEMS_PER_PAGE = 30
@@ -466,31 +721,35 @@ async def _get_channels_page(page=0, search=None):
     end_idx = start_idx + ITEMS_PER_PAGE
     current_items = visible[start_idx:end_idx]
 
-    message = f"📢 *MONITORED CHANNELS*\n\n"
+    # HTML throughout: channel titles are arbitrary text and "LOOT_DEALS_INDIA" is a
+    # completely ordinary name. In Markdown an odd number of underscores or asterisks
+    # makes Telegram reject the message, so /channels would fail to render at all.
+    message = "📢 <b>MONITORED CHANNELS</b>\n\n"
     active_names = [
         channel_display_name(ch_info)
         for ch_id, ch_info in channels_list if ch_id in active_ids
     ]
 
     if active_names:
-        message += "🟢 **Currently Tracking:**\n"
+        message += "🟢 <b>Currently tracking:</b>\n"
         for name in active_names[:40]:  # Limit to 40 in text to avoid message length limits
-            message += f"• {name[:50]}\n"
+            message += f"• {html.escape(name[:50])}\n"
         if len(active_names) > 40:
-            message += f"...and {len(active_names) - 40} more\n"
+            message += f"…and {len(active_names) - 40} more\n"
     else:
         message += "🔴 Not tracking any channels yet.\n"
 
     if search:
-        message += f"\n🔍 *Search:* `{search}` — {len(visible)} match(es)\n"
+        message += (f"\n🔍 <b>Search:</b> <code>{html.escape(search)}</code> — "
+                    f"{len(visible)} match(es)\n")
     else:
+        filters_str = html.escape(', '.join(CHANNEL_NAME_FILTERS))
         message += (
-            f"\n🔎 *Showing channels named* `{'`, `'.join(CHANNEL_NAME_FILTERS)}` "
-            f"*— {len(visible)} of {len(channels_list)} joined.*\n"
-            "Use /searchchannel `<text>` for the rest, or /addchannel `<link>` for a new one.\n"
+            f"\n🔎 <i>Showing channels named</i> <code>{filters_str}</code> — "
+            f"{len(visible)} of {len(channels_list)} joined.\n"
         )
 
-    message += f"\n*Toggle channels below (Page {page+1}/{total_pages}):*\n"
+    message += f"\n<b>Tap to toggle (page {page+1}/{total_pages}):</b>\n"
 
     keyboard = []
 
@@ -522,10 +781,17 @@ async def _get_channels_page(page=0, search=None):
     if search:
         keyboard.append([InlineKeyboardButton(
             "❎ Clear search", callback_data="ch_clear_search")])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("🔍 Search all", callback_data="ask_searchchannel"),
+            InlineKeyboardButton("➕ Add channel", callback_data="ask_addchannel"),
+        ])
 
     # Untrack All button
     if active_ids:
-        keyboard.append([InlineKeyboardButton("🛑 Untrack All Channels", callback_data="untrack_all_channels")])
+        keyboard.append([InlineKeyboardButton("🛑 Untrack all", callback_data="untrack_all_channels")])
+
+    keyboard.append([InlineKeyboardButton('« Menu', callback_data='menu_home')])
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     return message, reply_markup
@@ -540,8 +806,7 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(_SEARCH_KEY, None)  # /channels always leaves search mode
 
     try:
-        message, reply_markup = await _get_channels_page(page=0)
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        await _reply_view(update, await _get_channels_page(page=0))
     except Exception as e:
         logger.error(f"Error listing channels: {e}")
         await update.message.reply_text(f"❌ Error listing channels: {str(e)}")
@@ -555,20 +820,25 @@ async def search_channel_command(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if not context.args:
-        await update.message.reply_text(
-            "❌ What should I search for?\nExample: `/searchchannel loot`",
-            parse_mode='Markdown')
+        await _prompt(update, context, 'searchchannel')
+        return
+    await _apply_search_channel(update, context, ' '.join(context.args))
+
+
+async def _apply_search_channel(update, context, text):
+    if not monitor:
+        await update.effective_message.reply_text(
+            "⏳ Channel monitor loading, please try again in a moment.")
         return
 
-    query = ' '.join(context.args).strip()
+    query = text.strip()
     context.user_data[_SEARCH_KEY] = query
 
     try:
-        message, reply_markup = await _get_channels_page(page=0, search=query)
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        await _reply_view(update, await _get_channels_page(page=0, search=query))
     except Exception as e:
         logger.error(f"Error searching channels: {e}")
-        await update.message.reply_text(f"❌ Error searching channels: {str(e)}")
+        await update.effective_message.reply_text(f"❌ Error searching channels: {str(e)}")
 
 
 @owner_only
@@ -579,11 +849,24 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not context.args:
-        await update.message.reply_text("❌ Please specify a channel username or link.\nExample: `/addchannel @username` or `/addchannel https://t.me/username`", parse_mode='Markdown')
+        await _prompt(update, context, 'addchannel')
+        return
+    await _apply_add_channel(update, context, context.args[0])
+
+
+async def _apply_add_channel(update, context, text):
+    if not monitor:
+        await update.effective_message.reply_text(
+            "⏳ Channel monitor loading, please try again in a moment.")
         return
 
-    identifier = context.args[0]
-    await update.message.reply_text(f"⏳ Attempting to join and resolve `{identifier}`...", parse_mode='Markdown')
+    identifier = text.strip().split()[0] if text.strip() else ''
+    if not identifier:
+        await update.effective_message.reply_text("❌ I need a username or link.")
+        return
+
+    await update.effective_message.reply_text(
+        f"⏳ Joining <code>{html.escape(identifier)}</code>…", parse_mode='HTML')
 
     try:
         channel_info = await monitor.resolve_and_join_channel(identifier)
@@ -595,41 +878,70 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             # Make it active by default when manually added
             await db.toggle_channel(channel_info['channel_id'])
-            
-            await update.message.reply_text(f"✅ Successfully joined and started tracking **{channel_info['channel_name']}**!", parse_mode='Markdown')
+            await monitor.refresh_channels()
+
+            await update.effective_message.reply_text(
+                f"✅ Joined and now tracking "
+                f"<b>{html.escape(channel_info['channel_name'])}</b>!",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton('📢 All channels', callback_data='menu_channels')]]))
         else:
-            await update.message.reply_text("❌ Could not resolve this channel. Make sure it's a public channel or a valid invite link.")
+            await update.effective_message.reply_text(
+                "❌ Could not resolve this channel. Make sure it's a public channel "
+                "or a valid invite link.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to join channel: {str(e)}")
+        await update.effective_message.reply_text(f"❌ Failed to join channel: {str(e)}")
 
 
 @owner_only
 async def untrack_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Untrack a specific channel by name or username."""
     if not context.args:
-        await update.message.reply_text("❌ Please specify a channel name or username.\nExample: `/untrackchannel @dealsbox` or `/untrackchannel BIG DIWALI SALE`", parse_mode='Markdown')
+        await _prompt(update, context, 'untrackchannel')
         return
+    await _apply_untrack_channel(update, context, ' '.join(context.args))
 
-    identifier = ' '.join(context.args)
+
+async def _apply_untrack_channel(update, context, text):
+    identifier = text.strip()
     success = await db.untrack_specific_channel(identifier)
-    
+
     if success:
         if monitor:
             await monitor.refresh_channels()
-        await update.message.reply_text(f"🛑 Successfully untracked channel matching: `{identifier}`", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"🛑 Untracked channel matching: <code>{html.escape(identifier)}</code>",
+            parse_mode='HTML')
     else:
-        await update.message.reply_text(f"❌ Could not find an active channel matching `{identifier}` in your list.", parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            f"❌ No active channel matches <code>{html.escape(identifier)}</code>.\n"
+            f"Try /channels to toggle one directly.", parse_mode='HTML')
 
 @owner_only
 async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show recent matched deals."""
+    await _reply_view(update, await _render_deals())
+
+
+async def _render_deals():
+    """
+    Recent deals, shared by the command and the menu button.
+
+    HTML with html.escape(), matching the notifier. Product names and channel titles
+    are arbitrary text from a deal channel — one `*` or `_` in a Markdown message and
+    Telegram rejects the whole thing with "can't parse entities", so the list fails
+    to render rather than looking slightly wrong.
+    """
     deals = await db.get_recent_deals(hours=24)
+    back = InlineKeyboardMarkup([[InlineKeyboardButton('« Menu', callback_data='menu_home')]])
 
     if not deals:
-        await update.message.reply_text("📥 No matched deals in the last 24 hours.", parse_mode='Markdown')
-        return
+        return ("📥 No matched deals in the last 24 hours.\n\n"
+                "That's normal if your watchlist is small — /watchlist to check, "
+                "or /channels to add sources.", back)
 
-    message = f"🔥 *RECENT DEALS (Last 24h — {len(deals)} found)*\n\n"
+    message = f"🔥 <b>RECENT DEALS</b> (last 24h — {len(deals)} found)\n\n"
 
     for deal in deals[:10]:  # Show top 10
         product = deal.get('product_name') or deal.get('keyword_matched')
@@ -642,11 +954,12 @@ async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_ago = format_time_ago(max(0, time.time() - deal.get('matched_date', 0)))
 
         link = deal.get('message_link')
-        link_str = f" [Link]({link})" if link else ""
+        link_str = f" <a href=\"{html.escape(link, quote=True)}\">Link</a>" if link else ""
 
-        message += f"• *{product[:40]}*{price_str} ({channel}) — {time_ago}{link_str}\n"
+        message += (f"• <b>{html.escape(product[:40])}</b>{price_str} "
+                    f"({html.escape(channel)}) — {time_ago}{link_str}\n")
 
-    await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
+    return message, back
 
 
 @owner_only
@@ -654,7 +967,9 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Pause channel monitoring."""
     if monitor:
         await monitor.pause()
-        await update.message.reply_text("⏸️ Monitoring **paused**. Use `/resume` to start again.", parse_mode='Markdown')
+        await update.message.reply_text(
+            "⏸️ Monitoring <b>paused</b>. Use /resume to start again.",
+            parse_mode='HTML')
     else:
         await update.message.reply_text("❌ Monitor is not running.")
 
@@ -664,7 +979,8 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resume channel monitoring."""
     if monitor:
         await monitor.resume()
-        await update.message.reply_text("▶️ Monitoring **resumed**!", parse_mode='Markdown')
+        await update.message.reply_text(
+            "▶️ Monitoring <b>resumed</b>!", parse_mode='HTML')
     else:
         await update.message.reply_text("❌ Monitor is not running.")
 
@@ -672,6 +988,11 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot status and statistics."""
+    await _reply_view(update, await _render_stats())
+
+
+async def _render_stats():
+    """HTML like every other view — see _reply_view."""
     stats = await db.get_stats()
     is_paused = monitor.paused if monitor else True
 
@@ -679,18 +1000,115 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link_str = "🟢 Connected" if (monitor and monitor.is_connected()) else "🔴 Disconnected"
     uptime = format_time_ago(time.time() - _started_at)
 
-    msg = f"""
-📊 **NDT STATUS & STATS**
+    msg = f"""📊 <b>NDT STATUS</b>
 
-**Status:** {status_str}
-🔌 **Telethon Uplink:** {link_str}
-⏱️ **Uptime:** {uptime.replace(' ago', '')}
-🎯 **Tracked Keywords:** {stats['watchlist_count']}
-📢 **Monitored Channels:** {stats['active_channels']} / {stats['total_channels']}
-🔥 **Deals Found (24h):** {stats['deals_24h']}
-📦 **Total Deals All-Time:** {stats['total_deals']}
+<b>Status:</b> {status_str}
+🔌 <b>Telethon uplink:</b> {link_str}
+⏱️ <b>Uptime:</b> {uptime.replace(' ago', '')}
+🎯 <b>Tracked keywords:</b> {stats['watchlist_count']}
+📢 <b>Monitored channels:</b> {stats['active_channels']} / {stats['total_channels']}
+🔥 <b>Deals found (24h):</b> {stats['deals_24h']}
+📦 <b>Deals all-time:</b> {stats['total_deals']}"""
+    toggle = ('▶️ Resume', 'act_resume') if is_paused else ('⏸️ Pause', 'act_pause')
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle[0], callback_data=toggle[1]),
+         InlineKeyboardButton('📊 Channel report', callback_data='menu_report')],
+        [InlineKeyboardButton('« Menu', callback_data='menu_home')],
+    ])
+    return msg, markup
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Menu & quick keyboard
+# ══════════════════════════════════════════════════════════════════════
+
+def _menu_markup(is_paused):
+    toggle = ('▶️ Resume', 'act_resume') if is_paused else ('⏸️ Pause', 'act_pause')
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('📋 Watchlist', callback_data='menu_watchlist'),
+         InlineKeyboardButton('➕ Add keyword', callback_data='ask_watch')],
+        [InlineKeyboardButton('📢 Channels', callback_data='menu_channels'),
+         InlineKeyboardButton('🔍 Find channel', callback_data='ask_searchchannel')],
+        [InlineKeyboardButton('🔥 Recent deals', callback_data='menu_deals'),
+         InlineKeyboardButton('📊 Channel report', callback_data='menu_report')],
+        [InlineKeyboardButton('🧪 Test a message', callback_data='ask_testmatch'),
+         InlineKeyboardButton('⚙️ Status', callback_data='menu_stats')],
+        [InlineKeyboardButton(toggle[0], callback_data=toggle[1]),
+         InlineKeyboardButton('❓ Help', callback_data='menu_help')],
+    ])
+
+
+def _menu_text(is_paused):
+    state = '⏸️ Paused' if is_paused else '🟢 Monitoring'
+    return f"☰ <b>NDT MENU</b> — {state}\n\nPick something, or type a command."
+
+
+def _quick_keyboard():
     """
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    Persistent buttons under the input box.
+
+    The command menu is hidden behind a ⁄ tap and sends commands bare; these are
+    always visible and one tap each, which is what makes the bot usable one-handed
+    on a phone.
+    """
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton('📋 Watchlist'), KeyboardButton('🔥 Deals')],
+            [KeyboardButton('📢 Channels'), KeyboardButton('📊 Report')],
+            [KeyboardButton('➕ Watch'), KeyboardButton('☰ Menu')],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder='Tap a button or type a command',
+    )
+
+
+@owner_only
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The button hub — everything reachable without typing a command."""
+    is_paused = monitor.paused if monitor else True
+    await update.effective_message.reply_text(
+        _menu_text(is_paused), parse_mode='HTML',
+        reply_markup=_menu_markup(is_paused))
+
+
+@owner_only
+async def keyboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show or hide the persistent quick-action keyboard."""
+    arg = (context.args[0].lower() if context.args else 'on')
+    if arg in ('off', 'hide', 'no'):
+        await update.message.reply_text(
+            "⌨️ Quick keyboard hidden. Bring it back with /keyboard.",
+            reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text(
+            "⌨️ Quick keyboard on.", reply_markup=_quick_keyboard())
+
+
+# Text sent by the persistent keyboard, mapped to what it should do. Checked before
+# the pending-question handler, so a button tap always wins over a stale prompt.
+_QUICK_ACTIONS = {
+    '📋 Watchlist': lambda u, c: watchlist_command(u, c),
+    '🔥 Deals': lambda u, c: deals_command(u, c),
+    '📢 Channels': lambda u, c: channels_command(u, c),
+    '📊 Report': lambda u, c: channel_report_command(u, c),
+    '➕ Watch': lambda u, c: _prompt(u, c, 'watch'),
+    '☰ Menu': lambda u, c: menu_command(u, c),
+}
+
+# Pending-question action -> what consumes the user's answer.
+_APPLIERS = {
+    'watch': _apply_watch,
+    'unwatch': _apply_unwatch,
+    'synonyms': _apply_synonyms,
+    'updatesynonyms': _apply_update_synonyms,
+    'exclude': _apply_exclude,
+    'exclude_terms': _apply_exclude_terms,
+    'testmatch': _apply_testmatch,
+    'addchannel': _apply_add_channel,
+    'untrackchannel': _apply_untrack_channel,
+    'searchchannel': _apply_search_channel,
+}
 
 
 @owner_only
@@ -701,15 +1119,84 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # ── Menu navigation ──
+    if data == 'menu_home':
+        is_paused = monitor.paused if monitor else True
+        await query.edit_message_text(
+            _menu_text(is_paused), parse_mode='HTML',
+            reply_markup=_menu_markup(is_paused))
+        return
+
+    if data in ('menu_watchlist', 'menu_deals', 'menu_stats', 'menu_channels',
+                'menu_report', 'menu_help'):
+        back = InlineKeyboardMarkup(
+            [[InlineKeyboardButton('« Menu', callback_data='menu_home')]])
+        try:
+            if data == 'menu_watchlist':
+                view = await _render_watchlist()
+            elif data == 'menu_deals':
+                view = await _render_deals()
+            elif data == 'menu_stats':
+                view = await _render_stats()
+            elif data == 'menu_channels':
+                context.user_data.pop(_SEARCH_KEY, None)
+                view = await _get_channels_page(0)
+            elif data == 'menu_report':
+                view = (build_channel_report(await db.get_channel_report()), back)
+            else:
+                view = (HELP_TEXT, back)
+            # Deliberately no per-branch parse mode: every renderer above is HTML,
+            # and picking one here is how menu_stats and menu_help ended up claiming
+            # Markdown for HTML text — a 400, so the screen never opened.
+            await _edit_view(query, view)
+        except Exception as e:
+            logger.error(f"Menu render failed for {data}: {e}")
+            await query.answer("❌ Couldn't open that.", show_alert=True)
+        return
+
+    # ── A button that needs typed input: ask, then let the text handler finish ──
+    if data.startswith('ask_'):
+        await _prompt(update, context, data[len('ask_'):])
+        return
+
+    # ── Pause / resume from a button ──
+    if data in ('act_pause', 'act_resume'):
+        if not monitor:
+            await query.answer("❌ Monitor is not running.", show_alert=True)
+            return
+        if data == 'act_pause':
+            await monitor.pause()
+        else:
+            await monitor.resume()
+        is_paused = monitor.paused
+        await query.edit_message_text(
+            _menu_text(is_paused), parse_mode='HTML',
+            reply_markup=_menu_markup(is_paused))
+        await query.answer('⏸️ Paused' if is_paused else '▶️ Resumed')
+        return
+
+    # ── Keyword picked from a list ──
+    if data.startswith('syn_kw_'):
+        await _apply_synonyms(update, context, data[len('syn_kw_'):])
+        return
+
+    if data.startswith('exc_kw_'):
+        keyword = data[len('exc_kw_'):]
+        await _prompt(update, context, 'exclude_terms', keyword=keyword)
+        return
+
     # Delete keyword callback
     if data.startswith('del_kw_'):
-        keyword = data.replace('del_kw_', '')
+        keyword = data[len('del_kw_'):]
         success = await db.remove_keyword(keyword)
-        if success:
-            _invalidate_watchlist()
-            await query.edit_message_text(f"🗑️ Removed `{keyword}` from watchlist.", parse_mode='Markdown')
-        else:
-            await query.edit_message_text(f"❌ Error removing `{keyword}`.")
+        if not success:
+            await query.answer(f"❌ Couldn't remove {keyword}.", show_alert=True)
+            return
+        _invalidate_watchlist()
+        await query.answer(f"🗑️ Removed {keyword}")
+        # Re-render in place instead of replacing the list with a one-line
+        # confirmation — deleting two keywords used to mean re-running /watchlist.
+        await _edit_view(query, await _render_watchlist())
 
     # 👍 / 👎 on a deal alert
     elif data.startswith('fb_u_') or data.startswith('fb_d_'):
@@ -751,21 +1238,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             # Re-render the view the button was pressed in, search included.
-            msg, markup = await _get_channels_page(page, context.user_data.get(_SEARCH_KEY))
-            await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
+            await _edit_view(query, await _get_channels_page(
+                page, context.user_data.get(_SEARCH_KEY)))
         except Exception as e:
             logger.error(f"Error updating channels message: {e}")
             await query.edit_message_text("❌ Error updating channels.")
 
-    # Untrack all channels callback
+    # Untrack all channels — confirm first. This wipes every source in one tap and
+    # sat directly under the per-channel toggles, which is a mis-tap away.
     elif data == 'untrack_all_channels':
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton('⚠️ Yes, untrack everything',
+                                  callback_data='untrack_all_confirm')],
+            [InlineKeyboardButton('« Keep them', callback_data='page_ch_0')],
+        ]))
+        await query.answer('Are you sure?')
+
+    elif data == 'untrack_all_confirm':
         await db.untrack_all_channels()
         if monitor:
             await monitor.refresh_channels()
 
         try:
-            msg, markup = await _get_channels_page(0, context.user_data.get(_SEARCH_KEY))
-            await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
+            await _edit_view(query, await _get_channels_page(
+                0, context.user_data.get(_SEARCH_KEY)))
             await query.answer("🛑 Untracked all channels!")
         except Exception as e:
             logger.error(f"Error untracking all channels: {e}")
@@ -775,8 +1271,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'ch_clear_search':
         context.user_data.pop(_SEARCH_KEY, None)
         try:
-            msg, markup = await _get_channels_page(0)
-            await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
+            await _edit_view(query, await _get_channels_page(0))
         except Exception as e:
             logger.error(f"Error clearing channel search: {e}")
             await query.edit_message_text("❌ Error clearing search.")
@@ -785,8 +1280,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('page_ch_'):
         page = int(data.replace('page_ch_', ''))
         try:
-            msg, markup = await _get_channels_page(page, context.user_data.get(_SEARCH_KEY))
-            await query.edit_message_text(msg, reply_markup=markup, parse_mode='Markdown')
+            await _edit_view(query, await _get_channels_page(
+                page, context.user_data.get(_SEARCH_KEY)))
         except Exception as e:
             logger.error(f"Error paging channels: {e}")
             await query.edit_message_text("❌ Error changing pages.")
@@ -1036,24 +1531,30 @@ async def post_init(application):
 
     # ── 2. Then the slow work ──
     # Set bot commands menu
+    # Menu order = how often you'd reach for it. Descriptions say what happens when
+    # the command is tapped bare, because that is how the menu sends it — every one
+    # of these either acts immediately or asks for what it needs.
     await application.bot.set_my_commands([
-        BotCommand("watch", "Add product to watchlist"),
-        BotCommand("unwatch", "Remove product from watchlist"),
-        BotCommand("updatesynonyms", "Update custom synonyms for a keyword"),
-        BotCommand("exclude", "Block terms for a keyword"),
-        BotCommand("watchlist", "View & manage tracked products"),
-        BotCommand("testmatch", "Test if a message would trigger an alert"),
-        BotCommand("synonyms", "Show what terms a keyword matches"),
-        BotCommand("channels", "Select channels to monitor"),
-        BotCommand("searchchannel", "Search all joined channels by name"),
-        BotCommand("addchannel", "Join & track a new channel"),
-        BotCommand("untrackchannel", "Untrack a specific channel"),
-        BotCommand("channelreport", "Which channels are worth keeping"),
-        BotCommand("deals", "View recent matched deals"),
-        BotCommand("pause", "Pause monitoring"),
-        BotCommand("resume", "Resume monitoring"),
-        BotCommand("stats", "Check bot status"),
-        BotCommand("help", "How to use"),
+        BotCommand("menu", "☰ Everything, as buttons"),
+        BotCommand("watchlist", "📋 Your keywords — edit or delete"),
+        BotCommand("watch", "➕ Add a keyword (I'll ask)"),
+        BotCommand("channels", "📢 Pick channels to monitor"),
+        BotCommand("deals", "🔥 Deals matched in the last 24h"),
+        BotCommand("channelreport", "📊 Which channels are worth keeping"),
+        BotCommand("testmatch", "🧪 Would this message alert? (I'll ask)"),
+        BotCommand("exclude", "🚫 Block terms for a keyword"),
+        BotCommand("synonyms", "💡 What a keyword actually matches"),
+        BotCommand("updatesynonyms", "✏️ Change a keyword's synonyms"),
+        BotCommand("unwatch", "➖ Drop a keyword"),
+        BotCommand("searchchannel", "🔍 Search all joined channels"),
+        BotCommand("addchannel", "🔗 Join & track a new channel"),
+        BotCommand("untrackchannel", "🛑 Untrack a specific channel"),
+        BotCommand("stats", "⚙️ Status & uptime"),
+        BotCommand("pause", "⏸️ Pause monitoring"),
+        BotCommand("resume", "▶️ Resume monitoring"),
+        BotCommand("keyboard", "⌨️ Show/hide the quick buttons"),
+        BotCommand("cancel", "🚫 Cancel what I'm waiting for"),
+        BotCommand("help", "❓ How to use"),
     ])
     
     try:
@@ -1153,7 +1654,15 @@ def main():
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("keyboard", keyboard_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_callback))
+    # Registered LAST: it is the catch-all for plain text, and must not shadow a
+    # command. It answers whatever question the bot asked, or runs a quick-keyboard
+    # button.
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
 
     logger.info("🚀 NDT Telegram Bot initializing...")
 

@@ -12,11 +12,13 @@ scraper and preview-based extraction never ran at all.
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 # Point config at a throwaway directory before importing it — importing config
 # creates DATA_PATH/SESSION_PATH as a side effect.
@@ -50,13 +52,25 @@ _FAILURES = []
 _PASSES = []
 
 
+def _safe(text):
+    """
+    Printable on a Windows console.
+
+    A Windows terminal is cp1252 by default, so printing an emoji from a failure
+    detail raises UnicodeEncodeError and takes down the whole run — hiding the
+    failure it was trying to report.
+    """
+    encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+    return str(text).encode(encoding, errors='replace').decode(encoding, errors='replace')
+
+
 def check(name, condition, detail=''):
     if condition:
         _PASSES.append(name)
-        print(f"  PASS  {name}")
+        print(_safe(f"  PASS  {name}"))
     else:
         _FAILURES.append((name, detail))
-        print(f"  FAIL  {name} {detail}")
+        print(_safe(f"  FAIL  {name} {detail}"))
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────────
@@ -757,7 +771,9 @@ async def test_channel_list_is_filtered_to_deal_channels():
               'Daily News' not in labels and 'Cricket' not in labels, f"got {labels!r}")
         check('page keeps the tracked channel togglable', 'Tech Offers' in labels,
               f"got {labels!r}")
-        check('page explains the filter', 'searchchannel' in msg, f"got {msg!r}")
+        check('page explains the filter', 'Showing channels named' in msg, f"got {msg!r}")
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        check('page offers search and add', 'ask_searchchannel' in data, f"got {data}")
 
         msg, markup = await bot._get_channels_page(page=0, search='cricket')
         labels = ' | '.join(_button_labels(markup))
@@ -765,8 +781,8 @@ async def test_channel_list_is_filtered_to_deal_channels():
         check('search page offers a way back', 'Clear search' in labels, f"got {labels!r}")
 
         msg, markup = await bot._get_channels_page(page=0, search='zzzz')
-        check('empty search explains itself', markup is None and 'addchannel' in msg,
-              f"got {msg!r}")
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        check('empty search offers a way out', 'ask_addchannel' in data, f"got {data}")
     finally:
         bot.monitor, bot.db = saved_monitor, saved_db
 
@@ -991,6 +1007,283 @@ async def test_feedback_keyboard_fits_telegrams_limit():
     check('no channel id means no buttons', feedback_keyboard(None) is None)
 
 
+class _FakeMessage:
+    def __init__(self, text=''):
+        self.text = text
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+        return self
+
+
+class _FakeUpdate:
+    def __init__(self, text=''):
+        self.message = _FakeMessage(text)
+        self.effective_message = self.message
+        self.callback_query = None
+        self.effective_user = SimpleNamespace(id=1)
+
+
+class _FakeContext:
+    def __init__(self, args=None):
+        self.user_data = {}
+        self.args = args or []
+
+
+async def test_bare_commands_ask_instead_of_erroring():
+    """
+    Telegram's command menu sends a command BARE — there is no way to make the
+    client pre-fill "/watch " and wait. So a bare command must ask for its argument
+    and consume the next message, or the menu is unusable.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('bare commands ask for input', True, f'(skipped, {e})')
+        return
+
+    added = {}
+
+    class _StubDb:
+        async def add_keyword(self, keyword, synonyms='', exclusions=''):
+            added['args'] = (keyword, synonyms, exclusions)
+            return True
+
+    saved_db = bot.db
+    try:
+        bot.db = _StubDb()
+
+        # Bare /watch asks rather than erroring.
+        update, ctx = _FakeUpdate(), _FakeContext()
+        await bot.watch_command(update, ctx)
+        text, kwargs = update.message.replies[-1]
+        check('bare /watch asks a question', 'What should I watch for' in text,
+              f"got {text!r}")
+        check('the ask uses ForceReply',
+              type(kwargs.get('reply_markup')).__name__ == 'ForceReply',
+              f"got {kwargs.get('reply_markup')!r}")
+        check('the pending action is remembered',
+              ctx.user_data.get(bot._PENDING_KEY, {}).get('action') == 'watch',
+              f"got {ctx.user_data!r}")
+
+        # The next plain message is consumed as the argument.
+        reply = _FakeUpdate('shoes -kids')
+        await bot.text_input_handler(reply, ctx)
+        check('the answer reaches the command',
+              added.get('args') == ('shoes', '', 'kids'), f"got {added!r}")
+        check('the pending action is cleared',
+              bot._PENDING_KEY not in ctx.user_data, f"got {ctx.user_data!r}")
+
+        # /cancel abandons it.
+        update, ctx = _FakeUpdate(), _FakeContext()
+        await bot.watch_command(update, ctx)
+        await bot.cancel_command(_FakeUpdate('/cancel'), ctx)
+        check('cancel clears the pending action',
+              bot._PENDING_KEY not in ctx.user_data, f"got {ctx.user_data!r}")
+
+        # An unexpected message is acknowledged, never silently swallowed.
+        stray, ctx = _FakeUpdate('hello?'), _FakeContext()
+        await bot.text_input_handler(stray, ctx)
+        check('stray text gets a nudge', stray.message.replies, 'no reply sent')
+
+        # Passing the argument inline still works, with no question asked.
+        added.clear()
+        update, ctx = _FakeUpdate(), _FakeContext(args=['fridge'])
+        await bot.watch_command(update, ctx)
+        check('inline arguments skip the question',
+              added.get('args') == ('fridge', '', '') and
+              bot._PENDING_KEY not in ctx.user_data, f"got {added!r}")
+    finally:
+        bot.db = saved_db
+
+
+async def test_interface_wiring_has_no_dead_buttons():
+    """
+    A button whose callback_data nothing handles, or a keyboard label that maps to
+    no action, fails silently — the user taps and nothing happens. Check the wiring
+    matches instead of finding out in production.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('interface wiring is complete', True, f'(skipped, {e})')
+        return
+
+    # Every question the bot can ask must have something that consumes the answer.
+    missing = set(bot._PROMPTS) - set(bot._APPLIERS)
+    check('every prompt has an applier', not missing, f"missing {missing}")
+
+    # Every quick-keyboard button must map to an action, and vice versa.
+    labels = {b.text for row in bot._quick_keyboard().keyboard for b in row}
+    check('every keyboard button has an action',
+          labels == set(bot._QUICK_ACTIONS), f"keyboard {labels} vs {set(bot._QUICK_ACTIONS)}")
+
+    # Every menu button routes somewhere, and fits Telegram's callback_data limit.
+    routed = {'menu_home', 'menu_watchlist', 'menu_deals', 'menu_stats',
+              'menu_channels', 'menu_report', 'menu_help', 'act_pause', 'act_resume'}
+    for markup in (bot._menu_markup(True), bot._menu_markup(False)):
+        for row in markup.inline_keyboard:
+            for button in row:
+                data = button.callback_data
+                ok = data in routed or (
+                    data.startswith('ask_') and data[4:] in bot._PROMPTS)
+                check(f'menu button {data!r} is routed', ok, f"unrouted: {data}")
+                check(f'menu button {data!r} fits callback_data',
+                      bot._fits_callback(data), f"too long: {data}")
+
+
+async def test_watchlist_view_offers_per_keyword_actions():
+    try:
+        import bot
+    except ImportError as e:
+        check('watchlist offers actions', True, f'(skipped, {e})')
+        return
+
+    class _StubDb:
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def get_watchlist(self):
+            return self.rows
+
+    saved = bot.db
+    try:
+        bot.db = _StubDb([])
+        text, markup = await bot._render_watchlist()
+        check('empty watchlist offers an add button',
+              'ask_watch' in str(markup.inline_keyboard), f"got {markup}")
+
+        bot.db = _StubDb([{'keyword': 'shoes', 'custom_synonyms': '',
+                           'exclusions': 'kids'}])
+        text, markup = await bot._render_watchlist()
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        check('blocked terms are visible', 'blocked: kids' in text, f"got {text!r}")
+        check('each keyword can be edited or deleted',
+              {'exc_kw_shoes', 'syn_kw_shoes', 'del_kw_shoes'} <= set(data),
+              f"got {data}")
+
+        # A keyword too long for callback_data must not produce a button Telegram
+        # would reject with a 400.
+        bot.db = _StubDb([{'keyword': 'x' * 90, 'custom_synonyms': '', 'exclusions': ''}])
+        _, markup = await bot._render_watchlist()
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        check('over-long keywords produce no oversized button',
+              all(bot._fits_callback(d) for d in data), f"got {[len(d) for d in data]}")
+    finally:
+        bot.db = saved
+
+
+async def test_special_characters_cannot_break_a_view():
+    """
+    Every list view interpolates text the user does not control the shape of —
+    keywords like `iphone_15`, channels called `LOOT_DEALS_INDIA`, product titles
+    full of `*`. Under Telegram's legacy Markdown an odd number of `_` or `*` is a
+    hard 400 ("can't parse entities"), so the view fails to send at all rather than
+    looking slightly off. These views are HTML + html.escape(), like the notifier.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('special characters cannot break a view', True, f'(skipped, {e})')
+        return
+
+    nasty = 'iphone_15 *deal* <b>&'
+
+    class _StubDb:
+        async def get_watchlist(self):
+            return [{'keyword': nasty, 'custom_synonyms': '', 'exclusions': nasty}]
+
+        async def get_recent_deals(self, hours=24):
+            return [{'product_name': nasty, 'price': '999', 'channel_name': nasty,
+                     'matched_date': time.time(), 'keyword_matched': 'x',
+                     'message_link': 'https://t.me/c/1/2'}]
+
+        async def get_all_channels(self):
+            return [{'channel_id': 7, 'channel_name': f'{nasty} deals',
+                     'channel_username': 'x', 'active': 1}]
+
+    saved_db, saved_monitor = bot.db, bot.monitor
+    try:
+        bot.db = _StubDb()
+        bot.monitor = _FakeMonitor([])
+
+        views = {
+            'watchlist': (await bot._render_watchlist())[0],
+            'deals': (await bot._render_deals())[0],
+            'channels': (await bot._get_channels_page(0))[0],
+        }
+        for name, text in views.items():
+            check(f'{name} escapes angle brackets',
+                  '<b>&' not in text and '&lt;b&gt;' in text, f"got {text!r}")
+            # Every tag in the output must be one we opened deliberately.
+            tags = set(re.findall(r'</?([a-z]+)', text))
+            check(f'{name} emits only known tags',
+                  tags <= {'b', 'i', 'code', 'a', 'pre'}, f"got {tags}")
+            # Raw markdown specials are harmless now, and must survive as literals.
+            check(f'{name} keeps the underscore literal', 'iphone_15' in text,
+                  f"got {text!r}")
+    finally:
+        bot.db, bot.monitor = saved_db, saved_monitor
+
+
+_TELEGRAM_TAG = re.compile(r'</?(b|strong|i|em|u|s|code|pre|a|blockquote)(?:\s[^>]*)?>\Z')
+
+
+def _html_problems(text, label):
+    """
+    Telegram accepts a small fixed tag set and rejects the whole message otherwise.
+
+    An unknown tag or an unbalanced one is a 400, which means the screen never
+    appears at all — /help shipped broken exactly this way, because `<message>`
+    inside a <code> block reads as a tag.
+    """
+    problems, stack = [], []
+    for match in re.finditer(r'<[^>]*>', text):
+        tag = match.group(0)
+        if not _TELEGRAM_TAG.match(tag):
+            problems.append(f"{label}: unsupported tag {tag!r}")
+            continue
+        name = re.match(r'</?([a-z]+)', tag).group(1)
+        if tag.startswith('</'):
+            if not stack or stack.pop() != name:
+                problems.append(f"{label}: stray closing </{name}>")
+        else:
+            stack.append(name)
+    if stack:
+        problems.append(f"{label}: unclosed {stack}")
+    return problems
+
+
+async def test_static_text_is_valid_telegram_html():
+    try:
+        import bot
+    except ImportError as e:
+        check('static text is valid Telegram HTML', True, f'(skipped, {e})')
+        return
+
+    problems = []
+    problems += _html_problems(bot.HELP_TEXT, 'HELP_TEXT')
+    problems += _html_problems(bot._menu_text(True), 'menu')
+    for name, (question, _placeholder, hint) in bot._PROMPTS.items():
+        # exclude_terms carries a {keyword} slot; fill it the way _prompt does.
+        filled = question.replace('{keyword}', 'shoes')
+        problems += _html_problems(f"{filled}\n{hint}", f'prompt:{name}')
+
+    check('every static string is valid Telegram HTML', not problems,
+          '; '.join(problems))
+
+    # Everything is HTML now. A single Markdown send would reintroduce the drift
+    # that made a converted renderer fail at its old call site.
+    bot_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.py')
+    with open(bot_py, encoding='utf-8') as handle:
+        source = handle.read()
+    # Catches the indirect form too: a `mode = 'Markdown'` variable handed to
+    # parse_mode is exactly how menu_stats and menu_help ended up broken.
+    check('no Markdown sends remain', "'Markdown'" not in source,
+          "found a 'Markdown' parse mode in bot.py")
+
+
 async def main():
     tests = [
         test_main_installs_an_event_loop,
@@ -1021,6 +1314,11 @@ async def main():
         test_channel_report_renders,
         test_report_schedule_survives_restarts,
         test_feedback_keyboard_fits_telegrams_limit,
+        test_bare_commands_ask_instead_of_erroring,
+        test_interface_wiring_has_no_dead_buttons,
+        test_watchlist_view_offers_per_keyword_actions,
+        test_special_characters_cannot_break_a_view,
+        test_static_text_is_valid_telegram_html,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

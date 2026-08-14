@@ -68,6 +68,8 @@ everything else keeps working.
 | Bot answers but never alerts | `telethon_connected: false`, or no channels selected — run `/channels` |
 | A channel you joined is missing from `/channels` | Its name has no `deal`/`sale` in it. Find it with `/searchchannel <text>`, or widen `CHANNEL_NAME_FILTERS` |
 | A keyword stopped alerting | Check `/watchlist` for a 🚫 line, then `/testmatch <message>` — it prints `BLOCKED keyword:` when a negative keyword vetoed the match |
+| A command replies "❌ specify a…" | Fixed in v1.5.0 — bare commands ask instead. If you still see it, the deploy is on an older branch |
+| Buttons do nothing / a screen never opens | Telegram rejected the message. Check the logs for `Menu render failed` or a BadRequest about parse entities |
 | Channel report never arrives | `CHANNEL_REPORT_ENABLED=false`, or no channel is active. The schedule is stored in the database, so restarts do not reset it. `/channelreport` works on demand regardless |
 | `retry 1/2` then success in logs | Normal. Neon suspends when idle and briefly refuses the first connection while waking |
 | `👋 NDT shut down cleanly` | Normal. Every deploy and restart logs this. A real failure shows a traceback |

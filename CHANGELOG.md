@@ -2,6 +2,32 @@
 
 Why each change exists is in `claude.md`; how to deploy is in `DEPLOYMENT.md`.
 
+## v1.5.0
+
+**Commands now ask for what they need.** Tapping a command in Telegram's menu sends
+it bare, and every command needing an argument answered with an error — which made
+the menu useless. Send `/watch`, `/exclude`, `/testmatch` or any other with nothing
+and NDT asks, then takes your next message as the answer. `/cancel` backs out.
+Typing the argument inline still works exactly as before.
+
+**Buttons instead of retyping.** `/unwatch`, `/synonyms` and `/exclude` offer your
+watchlist as buttons. `/watchlist` gained per-keyword 🚫 block / 💡 synonyms / ❌
+delete, and deleting re-renders the list in place instead of replacing it with a
+one-line confirmation.
+
+**Added `/menu`** — a hub reaching every screen, with a « Menu button on each one —
+**and a persistent quick keyboard** (Watchlist · Deals · Channels · Report · Watch ·
+Menu) under the input box. `/keyboard off` hides it.
+
+**"Untrack all channels" now asks for confirmation.** It wiped every source in one
+tap, sitting directly under the per-channel toggles.
+
+**Fixed: a keyword or channel name with `_` or `*` broke the screen it appeared on.**
+Under Telegram's legacy Markdown that is a hard 400, so `/watchlist`, `/deals` and
+`/channels` failed to send rather than rendering oddly — and `LOOT_DEALS_INDIA` is an
+ordinary channel name. Everything the bot sends is now HTML with `html.escape()`,
+routed through one send path so the parse mode cannot drift from the renderer.
+
 ## v1.4.0
 
 **Negative keywords.** `/watch shoes -kids -women`, or `/exclude shoes | kids, women`

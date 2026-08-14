@@ -29,6 +29,8 @@ Release history: `CHANGELOG.md`.
 - **Price extraction** — `₹1,999`, `Rs 2,999`, `MRP ₹3,999`, `50% off`.
 - **Deduplication** — on product + price + keyword, so the same deal reposted with
   a new affiliate link is dropped.
+- **No command syntax to remember** — send any command bare and it asks for what it
+  needs; `/menu` and a persistent keyboard reach everything without typing.
 - **Owner-only** — only `OWNER_ID` can command the bot.
 
 ## Files

@@ -17,11 +17,40 @@ deduplicate → alert.
 
 ## Commands
 
-`/watch` `/unwatch` `/updatesynonyms` `/exclude` `/watchlist` — keywords.
-`/channels` `/searchchannel` `/addchannel` `/untrackchannel` — sources.
-`/deals` `/stats` `/channelreport` `/pause` `/resume` — status.
+`/menu` — the button hub. `/watch` `/unwatch` `/updatesynonyms` `/exclude`
+`/watchlist` — keywords. `/channels` `/searchchannel` `/addchannel`
+`/untrackchannel` `/channelreport` — sources. `/deals` `/stats` `/pause` `/resume`
+`/keyboard` `/cancel` — control.
+
 `/testmatch <text>` `/synonyms <keyword>` — **debug matching**; reach for these
 first, since a wrong match is indistinguishable from a right one from outside.
+
+## Interface rules (`bot.py`)
+
+> ⚠️ **A bare command must ASK, never error.** Telegram's command menu sends
+> `/watch` with no argument and there is no way to make the client pre-fill it, so
+> answering with "❌ specify a keyword" makes the entire menu useless. Every command
+> needing input calls `_prompt()`, which sends a `ForceReply` and parks the action in
+> `context.user_data`; `text_input_handler` feeds the next plain message to the
+> matching `_APPLIERS` entry. Commands still accept inline arguments unchanged.
+
+Where the argument is "one of your existing keywords" (`/unwatch`, `/synonyms`,
+`/exclude`), `_pick_keyword()` offers the watchlist as buttons instead of asking.
+Anything that won't fit `callback_data`'s 64 bytes falls back to being typed —
+`_fits_callback()` guards every generated button.
+
+`text_input_handler` is registered **last** and always replies to something. Silence
+after a tap reads as a broken bot.
+
+> ⚠️ **Everything the bot sends is HTML with `html.escape()`. Never Markdown.**
+> Keywords (`iphone_15`), channel titles (`LOOT_DEALS_INDIA`) and product names are
+> arbitrary text, and under legacy Markdown an odd number of `_` or `*` is a hard 400
+> — the screen fails to appear rather than looking wrong. Views return
+> `(text, markup)` and go out through `_reply_view` / `_edit_view`, which hardcode
+> the parse mode; picking one per call site is exactly how `menu_stats` and
+> `menu_help` ended up claiming Markdown for HTML text. Note `<` and `>` need
+> escaping even inside `<code>` — literal `<message>` in the help text was read as a
+> tag and broke `/help`. `test_static_text_is_valid_telegram_html` pins both.
 
 ## 1. Keyword matching (`keyword_matcher.py`)
 
@@ -207,7 +236,7 @@ Long-lived process on a small container — anything per-message compounds.
 
 ## Tests
 
-`python test_pipeline.py` — offline, no credentials or network. 165 assertions
+`python test_pipeline.py` — offline, no credentials or network. 231 assertions
 covering the `WebPagePending` retry, both preview API shapes, the lookalike-word
 false positives, category leakage, negative-keyword vetoes, channel counters
 surviving a deal prune, cache bounds, Postgres retry/translation, and the
