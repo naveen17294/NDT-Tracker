@@ -2,6 +2,14 @@
 
 This file serves as the system memory for the **NDT Tracker** project. It outlines the core architecture, advanced features, and edge-case handling mechanisms developed to make the bot robust and reliable.
 
+It records **why** things are the way they are — particularly the traps that cost
+real debugging time. Read the quoted warning blocks before changing the code they
+sit next to; each one marks a bug that shipped and looked fine from the outside.
+
+- `DEPLOYMENT.md` — env vars, deploy steps, failure signatures
+- `CHANGELOG.md` — what changed in each release
+- `PROJECT_CONTEXT.md` — overview and file map
+
 ## 🏗️ Architecture
 - **Dual-Client System:** Uses `telethon` (User API) to silently monitor other channels in the background, and `python-telegram-bot` (Bot API) to handle the UI and commands.
 - **Database:** `aiosqlite` is used for asynchronous database operations (storing deals, channels, and keywords).
