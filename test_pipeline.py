@@ -202,6 +202,128 @@ async def test_scraper_cache_is_bounded():
     check('scraper close clears cache', len(scraper._cache) == 0)
 
 
+async def test_postgres_retries_on_a_sleeping_database():
+    """
+    Serverless Postgres (Neon, Supabase) suspends an idle database and refuses
+    connections while it wakes. Without a retry the first query after an idle period
+    fails and the bot silently stops recording deals — so this pins that a
+    connection-level failure is retried and a query-level failure is not.
+    """
+    import asyncpg.exceptions as pgerr
+
+    backend = PostgresBackend('postgresql://u:p@h/db', max_retries=3, retry_delay=0.01)
+
+    # Classification
+    check('waking database is retryable',
+          backend.is_retryable(pgerr.CannotConnectNowError('starting up')))
+    check('dropped connection is retryable',
+          backend.is_retryable(pgerr.ConnectionDoesNotExistError('gone')))
+    check('closed client connection is retryable',
+          backend.is_retryable(pgerr.InterfaceError('connection closed')))
+    check('socket error is retryable', backend.is_retryable(ConnectionResetError()))
+    check('bad SQL is NOT retryable',
+          not backend.is_retryable(pgerr.SyntaxOrAccessError('boom')))
+    check('unique violation is NOT retryable',
+          not backend.is_retryable(pgerr.UniqueViolationError('dup')))
+
+    # A pool that refuses once (database waking), then succeeds.
+    class FakeConn:
+        def __init__(self, outcomes):
+            self.outcomes = outcomes
+
+        async def execute(self, sql, *params):
+            result = self.outcomes.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    class FakeAcquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakePool:
+        def __init__(self, outcomes):
+            self.conn = FakeConn(outcomes)
+            self.terminated = 0
+
+        def acquire(self):
+            return FakeAcquire(self.conn)
+
+        def terminate(self):
+            self.terminated += 1
+
+    pool = FakePool([pgerr.CannotConnectNowError('waking'), 'UPDATE 1'])
+    backend._pool = pool
+
+    async def fake_ensure():
+        if backend._pool is None:
+            backend._pool = pool
+        return backend._pool
+    backend._ensure_pool = fake_ensure
+
+    affected = await backend.execute('UPDATE t SET a = ? WHERE b = ?', (1, 2))
+    check('retry recovers from a waking database', affected == 1, f'got {affected}')
+    check('stale pool is discarded before retrying', pool.terminated == 1,
+          f'terminated={pool.terminated}')
+
+    # A non-retryable error must surface immediately, not burn retries.
+    pool2 = FakePool([pgerr.UniqueViolationError('dup'), 'INSERT 0 1'])
+    backend._pool = pool2
+
+    async def fake_ensure2():
+        if backend._pool is None:
+            backend._pool = pool2
+        return backend._pool
+    backend._ensure_pool = fake_ensure2
+
+    raised = None
+    try:
+        await backend.execute('INSERT INTO t VALUES (?)', (1,))
+    except Exception as e:
+        raised = e
+    check('query errors are not retried', isinstance(raised, pgerr.UniqueViolationError),
+          f'got {raised!r}')
+    check('pool not discarded on a query error', pool2.terminated == 0,
+          f'terminated={pool2.terminated}')
+
+    # Give up after max_retries rather than looping forever.
+    pool3 = FakePool([pgerr.CannotConnectNowError('waking')] * 5)
+    backend._pool = pool3
+
+    async def fake_ensure3():
+        if backend._pool is None:
+            backend._pool = pool3
+        return backend._pool
+    backend._ensure_pool = fake_ensure3
+
+    raised = None
+    try:
+        await backend.execute('SELECT 1', ())
+    except Exception as e:
+        raised = e
+    check('gives up after max_retries', isinstance(raised, pgerr.CannotConnectNowError),
+          f'got {raised!r}')
+    check('exhausted retries used the full budget', pool3.conn.outcomes and len(pool3.conn.outcomes) == 2,
+          f'remaining={len(pool3.conn.outcomes)}')
+
+
+async def test_postgres_pool_defaults_suit_serverless():
+    """min_size 0 lets a serverless database suspend instead of being held awake."""
+    backend = PostgresBackend('postgresql://u:p@h/db')
+    check('pool holds no idle connections by default', backend.min_size == 0,
+          f'got {backend.min_size}')
+    check('idle connections recycle before the provider suspends',
+          backend.max_idle <= 300, f'got {backend.max_idle}')
+    check('pool stays small for free-tier connection caps', backend.max_size <= 5,
+          f'got {backend.max_size}')
+
+
 async def test_database_shared_connection_and_retention():
     import time as _time
 
@@ -530,6 +652,8 @@ async def main():
         test_preview_cache_is_bounded,
         test_scraper_cache_is_bounded,
         test_storage_backend_selection_and_translation,
+        test_postgres_retries_on_a_sleeping_database,
+        test_postgres_pool_defaults_suit_serverless,
         test_database_shared_connection_and_retention,
         test_matcher_and_price_still_work,
         test_matcher_rejects_lookalike_words,

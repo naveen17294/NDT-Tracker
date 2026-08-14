@@ -167,21 +167,76 @@ class PostgresBackend:
     """
     asyncpg connection pool against an external Postgres.
 
-    The pool is deliberately small. This is one bot with a light query load, and free
-    Postgres tiers cap concurrent connections aggressively — Neon's free plan and
-    Supabase's pooler both punish a chatty client far more than a slow one.
+    The pool is deliberately small and holds nothing open by default. This is one bot
+    with a light query load, and free tiers cap concurrent connections aggressively —
+    Neon's free plan and Supabase's pooler both punish a chatty client far more than a
+    slow one.
+
+    Serverless Postgres needs two accommodations, and without them the bot appears to
+    work and then quietly stops recording deals after an idle period:
+
+    * The provider SUSPENDS an idle database and drops its connections. Holding a
+      connection open both fights that and burns the free tier's compute budget, so
+      min_size defaults to 0 and idle connections are recycled after 60s — comfortably
+      inside Neon's ~5 minute suspend window.
+    * A suspended database takes a moment to WAKE, and refuses connections while it
+      does. Every query is therefore retried a couple of times on connection-level
+      failures. Query errors (bad SQL, constraint violations) are never retried.
     """
 
     placeholder_style = 'numeric'
     name = 'postgres'
 
-    def __init__(self, dsn, min_size=1, max_size=3, command_timeout=30):
+    def __init__(self, dsn, min_size=None, max_size=None, command_timeout=None,
+                 max_idle=None, max_retries=None, retry_delay=None):
+        from config import (
+            DB_COMMAND_TIMEOUT,
+            DB_MAX_RETRIES,
+            DB_POOL_MAX_IDLE,
+            DB_POOL_MAX_SIZE,
+            DB_POOL_MIN_SIZE,
+            DB_RETRY_DELAY,
+        )
         self.dsn = normalise_dsn(dsn)
-        self.min_size = min_size
-        self.max_size = max_size
-        self.command_timeout = command_timeout
+        self.min_size = DB_POOL_MIN_SIZE if min_size is None else min_size
+        self.max_size = DB_POOL_MAX_SIZE if max_size is None else max_size
+        self.command_timeout = DB_COMMAND_TIMEOUT if command_timeout is None else command_timeout
+        self.max_idle = DB_POOL_MAX_IDLE if max_idle is None else max_idle
+        self.max_retries = DB_MAX_RETRIES if max_retries is None else max_retries
+        self.retry_delay = DB_RETRY_DELAY if retry_delay is None else retry_delay
         self._pool = None
         self._lock = asyncio.Lock()
+        self._retryable = None
+
+    def _retryable_errors(self):
+        """
+        Exception types worth retrying: the database is asleep, waking, or dropped a
+        socket. Built lazily and defensively — asyncpg's exception names have shifted
+        between releases, so a missing one must not break the whole backend.
+        """
+        if self._retryable is None:
+            types = [ConnectionError, OSError, asyncio.TimeoutError]
+            try:
+                import asyncpg.exceptions as pgerr
+                for name in (
+                    'ConnectionDoesNotExistError',   # server closed the connection
+                    'ConnectionFailureError',
+                    'CannotConnectNowError',         # database is starting up / waking
+                    'InterfaceError',                # client-side: connection is closed
+                    'TooManyConnectionsError',
+                    'ConnectionRejectionError',
+                    'PostgresConnectionError',
+                ):
+                    exc = getattr(pgerr, name, None)
+                    if exc is not None:
+                        types.append(exc)
+            except ImportError:
+                pass
+            self._retryable = tuple(types)
+        return self._retryable
+
+    def is_retryable(self, error):
+        return isinstance(error, self._retryable_errors())
 
     async def _ensure_pool(self):
         if self._pool is None:
@@ -200,9 +255,49 @@ class PostgresBackend:
                         min_size=self.min_size,
                         max_size=self.max_size,
                         command_timeout=self.command_timeout,
+                        max_inactive_connection_lifetime=self.max_idle,
                     )
-                    logger.info("✅ Postgres pool ready")
+                    logger.info(
+                        f"✅ Postgres pool ready "
+                        f"(min={self.min_size} max={self.max_size} idle={self.max_idle}s)"
+                    )
         return self._pool
+
+    async def _run(self, operation):
+        """
+        Run `operation(connection)` with retries on connection-level failures.
+
+        A suspended serverless database refuses the first connection while it wakes,
+        and a socket can go stale between pool checkout and use. Both are transient
+        and both look like a hard failure without this.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                pool = await self._ensure_pool()
+                async with pool.acquire() as conn:
+                    return await operation(conn)
+            except Exception as e:
+                if not self.is_retryable(e) or attempt >= self.max_retries:
+                    raise
+                logger.warning(
+                    f"Postgres call failed ({type(e).__name__}: {e}) — "
+                    f"retry {attempt}/{self.max_retries - 1}"
+                )
+                # The pool may be holding dead connections after a suspend; drop it
+                # so the next attempt dials fresh.
+                await self._discard_pool()
+                await asyncio.sleep(self.retry_delay * attempt)
+
+    async def _discard_pool(self):
+        """Throw away the pool without waiting for in-flight work."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            try:
+                pool.terminate()
+            except Exception as e:
+                logger.debug(f"Error terminating Postgres pool: {e}")
 
     async def connect(self):
         await self._ensure_pool()
@@ -224,28 +319,37 @@ class PostgresBackend:
             return 0
 
     async def execute(self, sql, params=()):
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
-            status = await conn.execute(to_pg_placeholders(sql), *params)
-            return self._rowcount(status)
+        statement = to_pg_placeholders(sql)
+
+        async def op(conn):
+            return self._rowcount(await conn.execute(statement, *params))
+
+        return await self._run(op)
 
     async def execute_many_ddl(self, statements):
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        async def op(conn):
             for statement in statements:
                 await conn.execute(statement)
 
+        return await self._run(op)
+
     async def fetch_all(self, sql, params=()):
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(to_pg_placeholders(sql), *params)
+        statement = to_pg_placeholders(sql)
+
+        async def op(conn):
+            rows = await conn.fetch(statement, *params)
             return [dict(row) for row in rows]
 
+        return await self._run(op)
+
     async def fetch_one(self, sql, params=()):
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(to_pg_placeholders(sql), *params)
+        statement = to_pg_placeholders(sql)
+
+        async def op(conn):
+            row = await conn.fetchrow(statement, *params)
             return dict(row) if row is not None else None
+
+        return await self._run(op)
 
     async def maintenance(self):
         """No-op — Postgres autovacuum handles reclamation."""

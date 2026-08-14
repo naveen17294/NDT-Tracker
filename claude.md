@@ -129,6 +129,18 @@ statement to syntax both engines accept:
 - `PRAGMA` is SQLite-only, so it lives behind `backend.maintenance()` (a no-op on
   Postgres, where autovacuum handles reclamation).
 
+**Serverless Postgres needs two accommodations.** Neon and Supabase suspend an idle
+database, and without these the bot appears to work and then quietly stops recording
+deals after a quiet period:
+
+- The provider **drops connections** when it suspends. Holding one open both fights
+  that and burns the free tier's compute budget, so `DB_POOL_MIN_SIZE` is `0` and idle
+  connections are recycled after 60s — inside Neon's ~5 minute suspend window.
+- A suspended database **refuses connections while it wakes**. Every query retries on
+  connection-level failures (`CannotConnectNowError`, `ConnectionDoesNotExistError`,
+  `InterfaceError`, socket errors), discarding the pool first so the retry dials
+  fresh. Query errors — bad SQL, constraint violations — are never retried.
+
 **Tools.** `python check_db.py` connects, creates the schema, round-trips a probe row
 and prints the current contents — run it after setting `DATABASE_URL` and before
 deploying. `python migrate_to_postgres.py` copies an existing SQLite file across; it

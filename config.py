@@ -40,6 +40,22 @@ OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 # Leave it empty to use SQLite at DB_PATH.
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 
+# Postgres pool tuning. The defaults are chosen for serverless providers (Neon,
+# Supabase), which suspend an idle database and drop its connections.
+#   min-size 0  — hold nothing open, so the database is free to suspend and we do
+#                 not burn the free tier's compute hours keeping it awake.
+#   max-idle 60 — recycle idle connections well before the provider kills them
+#                 (Neon suspends at roughly 5 minutes), so we rarely hand a dead
+#                 socket to a query in the first place.
+#   retries     — covers the residual race, plus the cold start when a suspended
+#                 database is waking up and briefly refuses connections.
+DB_POOL_MIN_SIZE = _env_int('DB_POOL_MIN_SIZE', 0)
+DB_POOL_MAX_SIZE = _env_int('DB_POOL_MAX_SIZE', 3)
+DB_POOL_MAX_IDLE = _env_int('DB_POOL_MAX_IDLE', 60)
+DB_COMMAND_TIMEOUT = _env_int('DB_COMMAND_TIMEOUT', 30)
+DB_MAX_RETRIES = _env_int('DB_MAX_RETRIES', 3)
+DB_RETRY_DELAY = float(os.getenv('DB_RETRY_DELAY', '0.5'))
+
 # Paths — used by the SQLite backend and always by the Telethon session file.
 # NOTE (deployment): on Render the container filesystem is EPHEMERAL. If you are on
 # SQLite, point DATA_PATH at a mounted persistent disk (e.g. DATA_PATH=/var/data/) or
