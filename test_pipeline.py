@@ -383,6 +383,36 @@ async def test_database_shared_connection_and_retention():
     await db.close()
 
 
+async def test_working_directories_never_crash_at_import():
+    """
+    config.py creates its working directories at import. That used to be an
+    unguarded os.makedirs, so a leftover DATA_PATH=/var/data/ from a disk-backed
+    deployment killed the process at import once the disk was detached — before
+    main() ran, so no port was bound and the deploy just failed.
+    """
+    from config import _ensure_dir
+
+    unusable = os.path.join('Z:' + os.sep, 'nonexistent-drive', 'data')
+
+    # Not needed (Postgres / SESSION_STRING in use) — must not even try.
+    _ensure_dir(unusable, False, 'test')
+    check('unneeded directory is skipped entirely', not os.path.exists(unusable))
+
+    # Needed but uncreatable — must warn, not raise.
+    raised = None
+    try:
+        _ensure_dir(unusable, True, 'test')
+    except Exception as e:
+        raised = e
+    check('uncreatable directory does not raise at import', raised is None,
+          f'raised {raised!r}')
+
+    # Needed and creatable — must actually create it.
+    wanted = os.path.join(_TMP, 'made-by-test')
+    _ensure_dir(wanted, True, 'test')
+    check('needed directory is created', os.path.isdir(wanted))
+
+
 async def test_storage_backend_selection_and_translation():
     """
     The Postgres path cannot be exercised without a live server, but everything that
@@ -651,6 +681,7 @@ async def main():
         test_preview_cache_hit,
         test_preview_cache_is_bounded,
         test_scraper_cache_is_bounded,
+        test_working_directories_never_crash_at_import,
         test_storage_backend_selection_and_translation,
         test_postgres_retries_on_a_sleeping_database,
         test_postgres_pool_defaults_suit_serverless,

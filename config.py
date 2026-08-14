@@ -156,6 +156,31 @@ KEEPALIVE_INTERVAL = _env_int('KEEPALIVE_INTERVAL', 600)  # 10 minutes
 # Telethon silently drops its connection on flaky hosts; the watchdog reconnects it.
 WATCHDOG_INTERVAL = _env_int('WATCHDOG_INTERVAL', 120)
 
-# Create directories
-os.makedirs(DATA_PATH, exist_ok=True)
-os.makedirs(SESSION_PATH, exist_ok=True)
+def _ensure_dir(path, needed, purpose):
+    """
+    Create a working directory, without letting it kill the process at import.
+
+    Two failure modes this guards against, both of which crashed the app before
+    main() could run — so the port was never bound and the host reported a failed
+    deploy with only a traceback to go on:
+
+    * The path is no longer creatable. A leftover DATA_PATH=/var/data/ from a
+      previous disk-backed deployment points at nothing once the disk is detached,
+      and the process cannot create /var/data itself.
+    * The path is not needed at all. With DATABASE_URL set the SQLite file is never
+      opened, and with SESSION_STRING set the session file is never written, so
+      failing over a directory neither will ever use is pure own-goal.
+    """
+    if not needed:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        # Deliberately not fatal. If the directory really is required, the failure
+        # resurfaces at first use with context about what was being opened.
+        print(f"WARNING: could not create {purpose} directory {path!r}: {e}")
+
+
+# Only create what this configuration actually uses.
+_ensure_dir(DATA_PATH, not DATABASE_URL, 'SQLite data')
+_ensure_dir(SESSION_PATH, not SESSION_STRING, 'Telethon session')
