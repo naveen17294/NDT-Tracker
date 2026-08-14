@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import html
 import logging
 import time
 
@@ -88,6 +89,8 @@ Monitoring encrypted channels 24/7 for zero-day drops and flash deals.
 💠 /unwatch `<keyword>` — Drop a target
 💠 /updatesynonyms `<keyword> | <synonyms>` — Update synonyms for a target
 💠 /watchlist — View active tracking matrix
+💠 /testmatch `<text>` — Dry-run a message through the matcher
+💠 /synonyms `<keyword>` — Show what a keyword actually matches
 💠 /channels — Uplink to deal channels
 💠 /addchannel `<link>` — Manually uplink to a new channel
 💠 /untrackchannel `<name>` — Instantly untrack a specific channel
@@ -213,6 +216,55 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑️ Removed `{keyword}` from watchlist.", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"❌ `{keyword}` was not found in your watchlist.", parse_mode='Markdown')
+
+
+@owner_only
+async def testmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dry-run the matcher against a message, without waiting for a real deal."""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Paste a message to test.\n"
+            "Example: `/testmatch Nike Running Shoes Rs 1999`",
+            parse_mode='Markdown'
+        )
+        return
+
+    text = ' '.join(context.args)
+    watchlist = await db.get_all_keywords()
+    report, result = matcher.explain(text, watchlist)
+
+    verdict = "✅ WOULD ALERT" if result else "🚫 WOULD NOT ALERT"
+    await update.message.reply_text(
+        f"<b>{verdict}</b>\n\n<pre>{html.escape(report)}</pre>",
+        parse_mode='HTML'
+    )
+
+
+@owner_only
+async def synonyms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show exactly what terms a keyword expands to."""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Specify a keyword.\nExample: `/synonyms shoes`",
+            parse_mode='Markdown'
+        )
+        return
+
+    keyword = ' '.join(context.args).strip()
+    rows = await db.get_watchlist()
+    custom = ''
+    for row in rows:
+        if row['keyword'] == keyword.lower():
+            custom = row.get('custom_synonyms', '') or ''
+            break
+
+    terms = matcher.get_synonyms(keyword, custom)
+    listed = '\n'.join(f"• {t}" for t in terms)
+    await update.message.reply_text(
+        f"<b>{html.escape(keyword)}</b> matches {len(terms)} term(s):\n\n"
+        f"<pre>{html.escape(listed)}</pre>",
+        parse_mode='HTML'
+    )
 
 
 @owner_only
@@ -638,6 +690,8 @@ async def post_init(application):
         BotCommand("unwatch", "Remove product from watchlist"),
         BotCommand("updatesynonyms", "Update custom synonyms for a keyword"),
         BotCommand("watchlist", "View & manage tracked products"),
+        BotCommand("testmatch", "Test if a message would trigger an alert"),
+        BotCommand("synonyms", "Show what terms a keyword matches"),
         BotCommand("channels", "Select channels to monitor"),
         BotCommand("addchannel", "Join & track a new channel"),
         BotCommand("untrackchannel", "Untrack a specific channel"),
@@ -732,6 +786,8 @@ def main():
     application.add_handler(CommandHandler("unwatch", unwatch_command))
     application.add_handler(CommandHandler("updatesynonyms", update_synonyms_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
+    application.add_handler(CommandHandler("testmatch", testmatch_command))
+    application.add_handler(CommandHandler("synonyms", synonyms_command))
     application.add_handler(CommandHandler("channels", channels_command))
     application.add_handler(CommandHandler("addchannel", add_channel_command))
     application.add_handler(CommandHandler("untrackchannel", untrack_channel_command))

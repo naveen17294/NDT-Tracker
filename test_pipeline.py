@@ -339,6 +339,136 @@ async def test_matcher_and_price_still_work():
     check('price parses with commas', price['price'] == 1999.0, f"got {price['price']}")
 
 
+async def test_matcher_rejects_lookalike_words():
+    """
+    Regression: a watchlist of ['shoes'] was firing on home-furnishing deals.
+
+    difflib.SequenceMatcher scores two 5-letter words sharing 4 characters at exactly
+    0.800, and the threshold was 0.75 — so 'homes', 'hoses' and 'shows' all matched
+    'shoes'. No threshold fixes that for short words, which is why fuzzy matching is
+    now off by default and plurals are handled by normalisation instead.
+    """
+    matcher = KeywordMatcher()
+    shoes = [('shoes', '')]
+
+    lookalikes = [
+        ('homes', 'Home decor for homes Rs 499'),
+        ('hoses', 'Garden hoses 10m heavy duty Rs 599'),
+        ('shows', 'Best shows streaming deal Rs 299'),
+        ('hose', 'Shower hose replacement Rs 349'),
+        ('those', 'Grab those deals now Rs 199'),
+        ('phones', 'Smartphones on sale Rs 9999'),
+    ]
+    for word, message in lookalikes:
+        result = matcher.match(message, shoes)
+        check(f"'{word}' does not match 'shoes'", result is None, f'got {result}')
+
+    check('unrelated product does not match',
+          matcher.match('Cello Opalware Dinner Set 27 Pcs Rs 1299', shoes) is None)
+
+
+async def test_matcher_still_finds_real_products():
+    """Precision fixes are worthless if they cost recall — these must all still match."""
+    matcher = KeywordMatcher()
+
+    cases = [
+        ('shoes', 'Nike Running Shoes Rs 1999', [('shoes', '')], 'exact'),
+        ('singular in text', 'Puma Sports Shoe for men Rs 1499', [('shoes', '')], 'plural'),
+        ('plural in text', 'Adidas Shoes combo Rs 2499', [('shoe', '')], 'plural'),
+        ('synonym oled', 'LG OLED 55 inch panel deal', [('tv', '')], 'synonym'),
+        ('synonym refrigerator', 'Samsung 236L Refrigerator Rs 24999', [('fridge', '')], 'synonym'),
+        ('synonym tws', 'Boat TWS wireless earphone Rs 999', [('earbuds', '')], 'synonym'),
+    ]
+    for desc, message, watchlist, expected_type in cases:
+        result = matcher.match(message, watchlist)
+        check(f'still matches: {desc}', result is not None, 'no match')
+        if result:
+            check(f'  match type for {desc} is {expected_type}',
+                  result['match_type'] == expected_type, f"got {result['match_type']}")
+
+    custom = [('shoes', 'sneakers, loafers')]
+    check('custom synonym still matches',
+          matcher.match('White Sneakers for men Rs 1299', custom) is not None)
+
+
+async def test_synonyms_do_not_leak_across_categories():
+    """
+    Regression: /watch 'air cooler' also matched air conditioners.
+
+    'air cooler' is listed under both the 'ac' and 'cooler' categories, and the
+    reverse lookup pulled in every owning category wholesale — so watching a cooler
+    dragged in 'split ac', 'window ac' and 'inverter ac'. An ambiguous term now
+    expands to nothing and matches only itself.
+    """
+    matcher = KeywordMatcher()
+    cooler = [('air cooler', '')]
+
+    expansion = matcher.get_synonyms('air cooler')
+    check('ambiguous term does not expand', expansion == ['air cooler'],
+          f'got {expansion}')
+
+    check('split AC does not match "air cooler"',
+          matcher.match('Voltas Split AC 1.5 Ton Rs 31999', cooler) is None)
+    check('window AC does not match "air cooler"',
+          matcher.match('Blue Star Window AC Rs 24999', cooler) is None)
+    check('a real cooler still matches',
+          matcher.match('Symphony Air Cooler 70L Rs 8999', cooler) is not None)
+
+    # Unambiguous terms must still expand normally.
+    check("'ac' still matches a split AC",
+          matcher.match('Daikin Split AC 1.5T Rs 35999', [('ac', '')]) is not None)
+    check("'fridge' still expands to its category",
+          'refrigerator' in matcher.get_synonyms('fridge'))
+
+
+async def test_synonym_order_is_deterministic_and_specific():
+    """
+    get_synonyms used to return list(set(...)). Python randomises string hashing per
+    process, so the reported matched_term changed between restarts.
+    """
+    matcher = KeywordMatcher()
+    tv = [('tv', '')]
+
+    terms = {matcher.match('Mi Smart TV 43 inch Rs 21999', tv)['matched_term']
+             for _ in range(50)}
+    check('matched_term is stable across runs', len(terms) == 1, f'got {terms}')
+
+    check('synonyms are sorted longest-first',
+          matcher.get_synonyms('tv') == sorted(matcher.get_synonyms('tv'),
+                                               key=lambda s: (-len(s), s)))
+
+    # Where the keyword itself is absent, the longest matching synonym should win.
+    # ('fridge' does not appear here; both 'refrigerator' and 'double door' do.)
+    result = matcher.match('LG 260L Double Door Refrigerator Rs 27499', [('fridge', '')])
+    check('most specific synonym wins',
+          result is not None and result['matched_term'] == 'refrigerator',
+          f"got {result['matched_term'] if result else None}")
+
+
+async def test_singularise_keeps_words_distinct():
+    """
+    The property that makes normalisation safe where fuzzy matching was not: each
+    word maps to exactly one singular form, and lookalikes stay distinct.
+    """
+    from keyword_matcher import singularise
+
+    pairs = [('shoes', 'shoe'), ('homes', 'home'), ('hoses', 'hose'),
+             ('shows', 'show'), ('watches', 'watch'), ('batteries', 'battery'),
+             ('boxes', 'box')]
+    for plural, expected in pairs:
+        got = singularise(plural)
+        check(f'singularise({plural!r}) -> {expected!r}', got == expected, f'got {got!r}')
+
+    forms = {singularise(w) for w in ('shoes', 'homes', 'hoses', 'shows')}
+    check('lookalike plurals stay distinct after normalising', len(forms) == 4,
+          f'collapsed to {forms}')
+
+    # Words that merely end in s must not be mangled.
+    for word in ('dress', 'glass', 'headphones'):
+        check(f'{word!r} survives singularise sensibly',
+              singularise(word) in (word, word[:-1]), f'got {singularise(word)!r}')
+
+
 async def test_main_installs_an_event_loop():
     """
     python-telegram-bot 21.x calls asyncio.get_event_loop() inside run_polling().
@@ -402,6 +532,11 @@ async def main():
         test_storage_backend_selection_and_translation,
         test_database_shared_connection_and_retention,
         test_matcher_and_price_still_work,
+        test_matcher_rejects_lookalike_words,
+        test_matcher_still_finds_real_products,
+        test_synonyms_do_not_leak_across_categories,
+        test_synonym_order_is_deterministic_and_specific,
+        test_singularise_keeps_words_distinct,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

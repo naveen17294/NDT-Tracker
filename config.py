@@ -99,7 +99,25 @@ URL_SHORTENERS = [
 ]
 
 # ── Keyword Matching ──
-FUZZY_MATCH_THRESHOLD = 0.75  # Minimum similarity for fuzzy match
+#
+# Fuzzy matching is OFF by default, and that is deliberate.
+#
+# difflib.SequenceMatcher scores two 5-letter words that share 4 characters at
+# exactly 0.800. With the old 0.75 threshold that made 'shoes' match 'homes',
+# 'hoses' and 'shows' — so a home-furnishing deal fired a shoes alert. No threshold
+# fixes this for short words: anything permissive enough to catch a real typo also
+# catches every unrelated word one edit away.
+#
+# The legitimate use of fuzzy matching was tolerating plurals ('shoe' vs 'shoes'),
+# and that is now handled exactly by singular/plural normalisation in
+# keyword_matcher.py, which cannot produce this class of false positive.
+#
+# If you turn fuzzy back on, the gates below keep it to long, similar-length words
+# where the ratio actually means something. Expect some noise regardless.
+FUZZY_MATCH_ENABLED = _env_bool('FUZZY_MATCH_ENABLED', False)
+FUZZY_MATCH_THRESHOLD = float(os.getenv('FUZZY_MATCH_THRESHOLD', '0.88'))
+FUZZY_MIN_LENGTH = _env_int('FUZZY_MIN_LENGTH', 7)      # skip short words entirely
+FUZZY_MAX_LENGTH_DIFF = _env_int('FUZZY_MAX_LENGTH_DIFF', 2)
 # The watchlist changes rarely but was previously re-read from SQLite on EVERY
 # incoming channel message. Cache it in memory for this many seconds.
 WATCHLIST_CACHE_TTL = _env_int('WATCHLIST_CACHE_TTL', 30)

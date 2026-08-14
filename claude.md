@@ -23,6 +23,41 @@ This file serves as the system memory for the **NDT Tracker** project. It outlin
 - **Word Boundaries:** Uses strict regex word boundaries (`\bword\b`) instead of substring matching. This prevents false positives (e.g., `pan` won't match `pant`, `tv` won't match `smartv`).
 - **URL Stripping:** Removes URLs from the message text *before* keyword matching. This prevents accidental matches inside URL slugs (e.g., matching `tv` inside `amzn.to/u5tv2`).
 - **Synonym Matrix:** Includes a massive built-in dictionary mapping core keywords to industry terms (e.g., `tv` -> `oled`, `qled`, `smart tv`).
+- **Match tiers:** `exact` (the watchlist keyword itself) > `synonym` > `plural` > `fuzzy`. Within a tier the longer, more specific term wins, so `refrigerator` is reported over `double door`. An exact hit on the keyword short-circuits the scan.
+
+> **Fuzzy matching is OFF by default. Read this before turning it on.**
+> `difflib.SequenceMatcher` scores two 5-letter words sharing 4 characters at exactly
+> **0.800**. The threshold was 0.75, so a watchlist of `shoes` matched `homes`,
+> `hoses` and `shows` — home-furnishing deals fired shoes alerts. This is not a
+> tuning problem: any threshold loose enough to catch a real typo on a short word
+> also catches every unrelated word one edit away from it.
+>
+> The only thing fuzzy matching genuinely bought us was plural tolerance (`shoe` /
+> `shoes`), and that is now done exactly by `singularise()`. Normalisation is safe
+> where similarity is not, because it maps each word to exactly one form —
+> `shoes→shoe`, `homes→home`, `hoses→hose`, `shows→show` all stay distinct, while
+> difflib scored every one of those pairs at 0.800.
+>
+> `FUZZY_MATCH_ENABLED=true` re-enables it behind gates (min length 7, threshold
+> 0.88, max length difference 2, n-grams compared only at equal word count). Expect
+> noise regardless.
+
+> **Synonym expansion is not transitive — don't make it so.**
+> A term can appear in two categories: `air cooler` is listed under both `ac` and
+> `cooler`. The reverse lookup used to pull in *every* owning category wholesale, so
+> `/watch "air cooler"` silently expanded to 11 terms including `split ac` and
+> `window ac` — watching a cooler alerted you about air conditioners. A term claimed
+> by more than one category now expands to nothing and matches only itself.
+
+`get_synonyms()` returns a **sorted** list. It previously returned `list(set(...))`,
+and Python randomises string hashing per process, so the reported `matched_term`
+changed between restarts.
+
+**Debugging matches:** `/testmatch <text>` dry-runs any message against the live
+watchlist and reports whether it would alert and why; `/synonyms <keyword>` prints
+every term a keyword expands to. Reach for these first — this class of bug stayed
+invisible for so long because a wrong match looks exactly like a right one from the
+outside.
 
 ### 2. Product Name Extraction & Scraping (`channel_monitor.py` & `link_scraper.py`)
 - **Primary Method (Native Previews):** The bot intercepts Telegram's native `MessageMediaWebPage` (link previews). Since Telegram's servers already bypassed Amazon's anti-bot protection to generate the preview, the bot instantly extracts the `title` and `description` from the payload without doing any HTTP requests. When a native preview exists, its title becomes the product name (not the first 100 chars of the marketing blast), which also makes the dedup hash far more stable.

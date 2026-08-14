@@ -1,7 +1,12 @@
 import difflib
 import re
 
-from config import FUZZY_MATCH_THRESHOLD
+from config import (
+    FUZZY_MATCH_ENABLED,
+    FUZZY_MATCH_THRESHOLD,
+    FUZZY_MAX_LENGTH_DIFF,
+    FUZZY_MIN_LENGTH,
+)
 from utils import clean_text, remove_emojis
 
 
@@ -80,8 +85,50 @@ SYNONYM_MAP = {
 }
 
 
+# Match tiers, best first. The tier decides which match wins; within a tier the
+# longer (more specific) term wins, so "smart tv" beats "tv" on the same message.
+TIER_EXACT = 0
+TIER_SYNONYM = 1
+TIER_PLURAL = 2
+TIER_FUZZY = 3
+
+_TIER_META = {
+    TIER_EXACT: ('exact', 'high'),
+    TIER_SYNONYM: ('synonym', 'high'),
+    TIER_PLURAL: ('plural', 'high'),
+    TIER_FUZZY: ('fuzzy', 'low'),
+}
+
+
+def singularise(word):
+    """
+    Reduce an English plural to its singular form.
+
+    Deliberately conservative — it only strips suffixes that are unambiguous. This
+    replaces what fuzzy matching was really being used for ('shoe' vs 'shoes') without
+    fuzzy's failure mode, because normalisation maps each word to exactly one form:
+    shoes->shoe, homes->home, hoses->hose, shows->show all stay distinct, whereas
+    difflib scored every one of those pairs at 0.800 and matched them.
+    """
+    if len(word) <= 3:
+        return word
+    if word.endswith('ies') and len(word) > 4:
+        return word[:-3] + 'y'
+    for suffix in ('ches', 'shes', 'sses', 'xes', 'zes'):
+        if word.endswith(suffix):
+            return word[:-2]
+    if word.endswith('s') and not word.endswith(('ss', 'us', 'is')):
+        return word[:-1]
+    return word
+
+
+def singularise_phrase(text):
+    """Singularise every word in a string, preserving word order and spacing."""
+    return ' '.join(singularise(word) for word in text.split())
+
+
 class KeywordMatcher:
-    """Smart keyword matching with synonyms and fuzzy matching."""
+    """Keyword matching with synonyms, plural handling and optional fuzzy matching."""
 
     def __init__(self):
         self.synonym_map = SYNONYM_MAP
@@ -89,48 +136,59 @@ class KeywordMatcher:
         # match() called it once per watchlist keyword per incoming message. Memoise
         # it — the inputs are a handful of stable strings.
         self._synonym_cache = {}
-        # Compiled word-boundary patterns, keyed by synonym. re's internal cache is
-        # only 512 entries and gets evicted by every other regex in the process.
+        # Compiled word-boundary patterns. re's internal cache is only 512 entries and
+        # gets evicted by every other regex in the process.
         self._pattern_cache = {}
 
-    def _pattern_for(self, synonym_lower):
-        pattern = self._pattern_cache.get(synonym_lower)
+    def _pattern_for(self, term):
+        pattern = self._pattern_cache.get(term)
         if pattern is None:
-            pattern = re.compile(rf'\b{re.escape(synonym_lower)}\b')
-            self._pattern_cache[synonym_lower] = pattern
+            pattern = re.compile(rf'\b{re.escape(term)}\b')
+            self._pattern_cache[term] = pattern
         return pattern
 
     def get_synonyms(self, keyword, custom_synonyms=''):
-        """Get all synonyms for a keyword (built-in + custom)."""
+        """
+        Get all search terms for a keyword (built-in synonyms + custom).
+
+        Returned sorted longest-first, then alphabetically. Sorting matters for two
+        reasons: the most specific term should win a match, and the previous version
+        returned list(set(...)), whose order varies between processes because Python
+        randomises string hashing — so `matched_term` changed across restarts.
+        """
         cache_key = (keyword.lower().strip(), (custom_synonyms or '').lower().strip())
         cached = self._synonym_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        keyword = keyword.lower().strip()
-        synonyms = set()
+        keyword = cache_key[0]
+        synonyms = {keyword}
 
-        # Add the keyword itself
-        synonyms.add(keyword)
-
-        # Add built-in synonyms
+        # Forward lookup: the keyword names a category outright.
         if keyword in self.synonym_map:
             synonyms.update(self.synonym_map[keyword])
 
-        # Check if keyword matches any synonym (reverse lookup)
-        for main_keyword, syns in self.synonym_map.items():
-            if keyword in syns:
-                synonyms.add(main_keyword)
-                synonyms.update(syns)
+        # Reverse lookup: the keyword is a synonym inside some category.
+        #
+        # Only expand when exactly one category claims it. A term can sit in two
+        # categories — 'air cooler' is listed under both 'ac' and 'cooler' — and
+        # pulling in every owner meant /watch "air cooler" also matched 'split ac',
+        # 'window ac' and 'inverter ac'. Watching a cooler should not alert you about
+        # air conditioners, so an ambiguous term expands to nothing and matches only
+        # itself.
+        owners = [key for key, syns in self.synonym_map.items() if keyword in syns]
+        if len(owners) == 1:
+            synonyms.add(owners[0])
+            synonyms.update(self.synonym_map[owners[0]])
 
-        # Add custom synonyms
+        # Custom synonyms are always honoured — the user asked for them explicitly.
         if custom_synonyms:
             for syn in custom_synonyms.split(','):
                 syn = syn.strip()
                 if syn:
                     synonyms.add(syn)
 
-        result = list(synonyms)
+        result = sorted(synonyms, key=lambda s: (-len(s), s))
         self._synonym_cache[cache_key] = result
         return result
 
@@ -139,16 +197,16 @@ class KeywordMatcher:
         Check if text matches any keyword in the watchlist.
 
         Args:
-            text: Message text to check (already cleaned preferred)
+            text: Message text to check
             watchlist: List of tuples [(keyword, custom_synonyms), ...]
 
         Returns:
             dict or None:
                 {
-                    'keyword': str,          # Original watchlist keyword
-                    'matched_term': str,      # The actual term that matched
-                    'confidence': str,        # 'high', 'medium', 'low'
-                    'match_type': str,        # 'exact', 'synonym', 'fuzzy'
+                    'keyword': str,        # Original watchlist keyword
+                    'matched_term': str,   # The actual term that matched
+                    'confidence': str,     # 'high' or 'low'
+                    'match_type': str,     # 'exact', 'synonym', 'plural', 'fuzzy'
                 }
         """
         if not text or not watchlist:
@@ -158,56 +216,125 @@ class KeywordMatcher:
         if not cleaned:
             return None
 
-        # Split text into words for word-level matching
-        words = cleaned.split()
-        # Also create bigrams and trigrams for multi-word matches
-        bigrams = [' '.join(words[i:i+2]) for i in range(len(words)-1)]
-        trigrams = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
-        all_ngrams = words + bigrams + trigrams
+        # Singularised copy of the message, so 'shoes' in the watchlist can match
+        # 'shoe' in the text and vice versa without any similarity guessing.
+        cleaned_singular = singularise_phrase(cleaned)
 
-        best_match = None
-        best_confidence = 0
+        best = None
+        best_rank = None  # (tier, -len(term)) — lower sorts better
 
         for keyword, custom_synonyms in watchlist:
-            synonyms = self.get_synonyms(keyword, custom_synonyms)
+            keyword_lower = keyword.lower().strip()
 
-            for synonym in synonyms:
+            for synonym in self.get_synonyms(keyword, custom_synonyms):
                 synonym_lower = synonym.lower()
+                is_keyword_itself = synonym_lower == keyword_lower
 
-                # ── Priority 1: Exact word-boundary match in full text ──
+                # ── Tier 0/1: exact word-boundary match ──
                 if self._pattern_for(synonym_lower).search(cleaned):
-                    confidence = 1.0
-                    match_type = 'exact' if synonym_lower == keyword.lower() else 'synonym'
-                    if confidence > best_confidence:
-                        best_confidence = confidence
-                        best_match = {
-                            'keyword': keyword,
-                            'matched_term': synonym,
-                            'confidence': 'high',
-                            'match_type': match_type,
-                        }
-                    # High confidence exact match — return immediately
-                    if match_type == 'exact':
-                        return best_match
+                    tier = TIER_EXACT if is_keyword_itself else TIER_SYNONYM
+                    rank = (tier, -len(synonym_lower))
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best = self._result(keyword, synonym, tier)
+                    # An exact hit on the keyword itself is the best possible outcome.
+                    if tier == TIER_EXACT:
+                        return best
                     continue
 
-                # ── Priority 2: Fuzzy match against n-grams ──
-                for ngram in all_ngrams:
-                    ratio = difflib.SequenceMatcher(None, synonym_lower, ngram).ratio()
-                    if ratio >= FUZZY_MATCH_THRESHOLD and ratio > best_confidence:
-                        best_confidence = ratio
-                        best_match = {
-                            'keyword': keyword,
-                            'matched_term': f"{synonym} (~{ngram})",
-                            'confidence': 'medium' if ratio >= 0.85 else 'low',
-                            'match_type': 'fuzzy',
-                        }
+                # ── Tier 2: plural/singular variant ──
+                synonym_singular = singularise_phrase(synonym_lower)
+                if (synonym_singular != synonym_lower or cleaned_singular != cleaned) \
+                        and self._pattern_for(synonym_singular).search(cleaned_singular):
+                    rank = (TIER_PLURAL, -len(synonym_lower))
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best = self._result(keyword, synonym, TIER_PLURAL)
+                    continue
 
-        return best_match
+                # ── Tier 3: fuzzy, off by default ──
+                if not FUZZY_MATCH_ENABLED:
+                    continue
+                fuzzy = self._fuzzy_match(synonym_lower, cleaned)
+                if fuzzy is not None:
+                    ratio, ngram = fuzzy
+                    rank = (TIER_FUZZY, -ratio)
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best = self._result(
+                            keyword, f"{synonym} (~{ngram})", TIER_FUZZY
+                        )
+
+        return best
+
+    def _fuzzy_match(self, synonym_lower, cleaned):
+        """
+        Best fuzzy candidate for a synonym, or None.
+
+        Heavily gated. difflib's ratio is only meaningful for reasonably long strings
+        of similar length: two 5-letter words differing by one character score 0.800,
+        which is why the old 0.75 threshold matched 'shoes' to 'homes'.
+        """
+        if len(synonym_lower) < FUZZY_MIN_LENGTH:
+            return None
+
+        words = cleaned.split()
+        # Compare against n-grams of the same word count as the synonym, so a
+        # single word is never compared against a three-word phrase.
+        span = len(synonym_lower.split())
+        ngrams = [' '.join(words[i:i + span]) for i in range(len(words) - span + 1)]
+
+        best = None
+        for ngram in ngrams:
+            if len(ngram) < FUZZY_MIN_LENGTH:
+                continue
+            if abs(len(ngram) - len(synonym_lower)) > FUZZY_MAX_LENGTH_DIFF:
+                continue
+            ratio = difflib.SequenceMatcher(None, synonym_lower, ngram).ratio()
+            if ratio >= FUZZY_MATCH_THRESHOLD and (best is None or ratio > best[0]):
+                best = (ratio, ngram)
+        return best
+
+    @staticmethod
+    def _result(keyword, matched_term, tier):
+        match_type, confidence = _TIER_META[tier]
+        return {
+            'keyword': keyword,
+            'matched_term': matched_term,
+            'confidence': confidence,
+            'match_type': match_type,
+        }
+
+    def explain(self, text, watchlist):
+        """
+        Human-readable account of why a message did or didn't match.
+
+        Backs the /testmatch bot command. This class of bug was invisible for so long
+        because a wrong match looked exactly like a right one from the outside.
+        """
+        cleaned = clean_text(remove_emojis(text))
+        lines = [f"Cleaned text: {cleaned[:200] or '(empty)'}"]
+        lines.append(f"Fuzzy matching: {'ON' if FUZZY_MATCH_ENABLED else 'OFF'}")
+
+        if not watchlist:
+            lines.append("Watchlist is empty — nothing can match.")
+            return '\n'.join(lines), None
+
+        result = self.match(text, watchlist)
+        if result:
+            lines.append("")
+            lines.append(f"MATCHED keyword: {result['keyword']}")
+            lines.append(f"  via term  : {result['matched_term']}")
+            lines.append(f"  match type: {result['match_type']} ({result['confidence']})")
+        else:
+            lines.append("")
+            lines.append("No match.")
+            lines.append(f"Checked {len(watchlist)} keyword(s): "
+                         + ', '.join(k for k, _ in watchlist[:10]))
+        return '\n'.join(lines), result
 
     def get_display_synonyms(self, keyword, custom_synonyms=''):
         """Get a short display list of synonyms for UI."""
         synonyms = self.get_synonyms(keyword, custom_synonyms)
-        # Remove the keyword itself from display
-        display = [s for s in synonyms if s != keyword.lower()]
+        display = [s for s in synonyms if s != keyword.lower().strip()]
         return display[:5]  # Show max 5 for readability
