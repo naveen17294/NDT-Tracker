@@ -160,6 +160,18 @@ CHANNEL_NAME_FILTERS = [
     ) if term
 ]
 
+# ── Channel quality report ──
+# A digest of which tracked channels are actually earning their place, sent on a
+# timer. It reads per-channel COUNTERS (channel_stats), never an alert log — NDT
+# keeps no history of alerts, so the report works from running totals plus a snapshot
+# taken at the previous report.
+CHANNEL_REPORT_HOURS = _env_int('CHANNEL_REPORT_HOURS', 8)
+CHANNEL_REPORT_ENABLED = _env_bool('CHANNEL_REPORT_ENABLED', True)
+# A tracked channel that has sent nothing in this long is flagged as dead weight.
+CHANNEL_QUIET_DAYS = _env_int('CHANNEL_QUIET_DAYS', 7)
+# Rows per report. Telegram caps a message at 4096 characters.
+CHANNEL_REPORT_MAX_ROWS = _env_int('CHANNEL_REPORT_MAX_ROWS', 25)
+
 # ── Deduplication & Retention ──
 DEDUP_HOURS = _env_int('DEDUP_HOURS', 24)   # Don't re-notify same deal within this window
 NOTIFIER_DEDUP_WINDOW = _env_int('NOTIFIER_DEDUP_WINDOW', 300)  # in-memory alert suppression

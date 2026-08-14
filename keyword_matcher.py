@@ -127,6 +127,23 @@ def singularise_phrase(text):
     return ' '.join(singularise(word) for word in text.split())
 
 
+def parse_exclusions(exclusions):
+    """
+    Split a stored exclusions string into terms.
+
+    Accepts commas or whitespace as separators, so both `/exclude shoes | kids, women`
+    and the inline `/watch shoes -kids -women` form land in the same shape.
+    """
+    if not exclusions:
+        return []
+    terms = []
+    for chunk in exclusions.split(','):
+        term = chunk.strip().lower()
+        if term:
+            terms.append(term)
+    return terms
+
+
 class KeywordMatcher:
     """Keyword matching with synonyms, plural handling and optional fuzzy matching."""
 
@@ -198,7 +215,9 @@ class KeywordMatcher:
 
         Args:
             text: Message text to check
-            watchlist: List of tuples [(keyword, custom_synonyms), ...]
+            watchlist: List of tuples [(keyword, custom_synonyms, exclusions), ...].
+                       The third element is optional — a plain (keyword, synonyms)
+                       pair still works.
 
         Returns:
             dict or None:
@@ -223,8 +242,16 @@ class KeywordMatcher:
         best = None
         best_rank = None  # (tier, -len(term)) — lower sorts better
 
-        for keyword, custom_synonyms in watchlist:
+        for entry in watchlist:
+            keyword, custom_synonyms = entry[0], entry[1]
+            exclusions = entry[2] if len(entry) > 2 else ''
             keyword_lower = keyword.lower().strip()
+
+            # Negative keywords veto this keyword for this message, before any term is
+            # tried. Scoped to the one keyword on purpose: `/watch shoes -kids` must
+            # not stop a `laptop` on the watchlist from matching the same message.
+            if self.is_excluded(cleaned, cleaned_singular, exclusions):
+                continue
 
             for synonym in self.get_synonyms(keyword, custom_synonyms):
                 synonym_lower = synonym.lower()
@@ -266,6 +293,32 @@ class KeywordMatcher:
                         )
 
         return best
+
+    def is_excluded(self, cleaned, cleaned_singular, exclusions):
+        """
+        True if any negative keyword appears in the message.
+
+        Uses the same word-boundary + singularisation machinery as a positive match,
+        so `-kids` blocks "kid" too and cannot fire on a substring — `-pen` must not
+        veto "expensive". Exclusions are always word-for-word: no synonym expansion,
+        because the user naming a term to block means that term, not a category.
+        """
+        for term in parse_exclusions(exclusions):
+            if self._pattern_for(term).search(cleaned):
+                return True
+            singular = singularise_phrase(term)
+            if self._pattern_for(singular).search(cleaned_singular):
+                return True
+        return False
+
+    def excluded_terms(self, text, exclusions):
+        """Which negative keywords a message trips. Backs /testmatch's explanation."""
+        cleaned = clean_text(remove_emojis(text))
+        cleaned_singular = singularise_phrase(cleaned)
+        return [
+            term for term in parse_exclusions(exclusions)
+            if self.is_excluded(cleaned, cleaned_singular, term)
+        ]
 
     def _fuzzy_match(self, synonym_lower, cleaned):
         """
@@ -320,6 +373,18 @@ class KeywordMatcher:
             lines.append("Watchlist is empty — nothing can match.")
             return '\n'.join(lines), None
 
+        # Keywords that WOULD have matched but were vetoed by a negative keyword.
+        # Reporting these is the whole point: a suppressed alert is invisible
+        # otherwise, and looks identical to a keyword that simply didn't match.
+        vetoed = []
+        for entry in watchlist:
+            exclusions = entry[2] if len(entry) > 2 else ''
+            if not exclusions:
+                continue
+            tripped = self.excluded_terms(text, exclusions)
+            if tripped and self.match(text, [(entry[0], entry[1])]):
+                vetoed.append((entry[0], tripped))
+
         result = self.match(text, watchlist)
         if result:
             lines.append("")
@@ -330,7 +395,13 @@ class KeywordMatcher:
             lines.append("")
             lines.append("No match.")
             lines.append(f"Checked {len(watchlist)} keyword(s): "
-                         + ', '.join(k for k, _ in watchlist[:10]))
+                         + ', '.join(entry[0] for entry in watchlist[:10]))
+
+        for keyword, tripped in vetoed:
+            lines.append("")
+            lines.append(f"BLOCKED keyword: {keyword}")
+            lines.append(f"  would have matched, but you excluded: {', '.join(tripped)}")
+
         return '\n'.join(lines), result
 
     def get_display_synonyms(self, keyword, custom_synonyms=''):

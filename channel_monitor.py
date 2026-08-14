@@ -293,6 +293,10 @@ class ChannelMonitor:
         if chat_id not in self._monitored_channel_ids and raw_id not in self._monitored_channel_ids:
             return
 
+        # Whichever form the channels table actually stores, so per-channel counters
+        # and 👍/👎 feedback attribute to the same row the channel list shows.
+        monitored_id = chat_id if chat_id in self._monitored_channel_ids else raw_id
+
         # Get message text (body + caption for media messages)
         text = event.message.message or ''
 
@@ -405,6 +409,7 @@ class ChannelMonitor:
             'original_price': price_info['original_price'],
             'discount': price_info['discount'],
             'channel_name': channel_username,
+            'channel_id': monitored_id,
             'message_link': message_link,
             'deal_url': deal_url,
             'timestamp': time.time(),
@@ -421,8 +426,15 @@ class ChannelMonitor:
             message_link=message_link or '',
         )
 
-        # Send notification
-        await self.notifier.send_deal_alert(OWNER_ID, deal_info)
+        # Send notification. Only count it against the channel if it actually went
+        # out — the notifier drops in-window duplicates, and those would otherwise
+        # inflate a channel's alert total without you ever seeing them.
+        sent = await self.notifier.send_deal_alert(OWNER_ID, deal_info)
+        if sent:
+            try:
+                await self.db.record_alert(monitored_id)
+            except Exception as e:
+                logger.warning(f"Could not record channel alert counter: {e}")
         logger.info(
             f"Deal matched! Keyword='{match_result['keyword']}' "
             f"Product='{product_name[:50]}' "

@@ -4,10 +4,30 @@ import logging
 import time
 from collections import OrderedDict
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 from config import NOTIFIER_CACHE_SIZE, NOTIFIER_DEDUP_WINDOW
 from utils import format_price, format_time_ago, truncate
 
 logger = logging.getLogger(__name__)
+
+
+def feedback_keyboard(channel_id):
+    """
+    The 👍/👎 row attached to every alert.
+
+    The channel id rides in the callback data, which is what makes rating work
+    without storing anything about the alert: the vote is attributed to the channel
+    when the button is pressed, and the message itself is the only record that it was
+    ever offered. Telegram caps callback_data at 64 bytes — a channel id is ~14
+    digits, so this stays well inside it.
+    """
+    if channel_id is None:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('👍 Good', callback_data=f'fb_u_{channel_id}'),
+        InlineKeyboardButton('👎 Junk', callback_data=f'fb_d_{channel_id}'),
+    ]])
 
 
 class Notifier:
@@ -68,7 +88,7 @@ class Notifier:
 
         if dedupe_key in self.sent_deals:
             logger.info(f"🚫 Skipped duplicate deal alert: {dedupe_key}")
-            return
+            return False
 
         # Mark as sent
         self.sent_deals[dedupe_key] = now
@@ -81,10 +101,13 @@ class Notifier:
                 text=message,
                 parse_mode='HTML',
                 disable_web_page_preview=False,
+                reply_markup=feedback_keyboard(deal_info.get('channel_id')),
             )
             logger.info(f"Deal alert sent: {deal_info.get('product_name', 'Unknown')}")
+            return True
         except Exception as e:
             logger.error(f"Failed to send deal alert: {e}")
+            return False
 
     def _format_alert(self, info):
         """Format deal info into a beautiful Telegram message using HTML to prevent parsing errors."""

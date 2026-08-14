@@ -132,6 +132,24 @@ class SqliteBackend:
             await conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await conn.commit()
 
+    async def add_column_if_missing(self, table, column, definition):
+        """
+        Additive migration for a table that already exists in a deployed database.
+
+        SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list has to be read
+        first — re-running ALTER TABLE otherwise errors and takes the whole boot with
+        it. Returns True if the column was actually added.
+        """
+        async with self._lock:
+            conn = await self._ensure_conn()
+            cursor = await conn.execute(f'PRAGMA table_info({table})')
+            rows = await cursor.fetchall()
+            if any(row['name'] == column for row in rows):
+                return False
+            await conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            await conn.commit()
+            return True
+
     def schema(self):
         return [
             '''CREATE TABLE IF NOT EXISTS watchlist (
@@ -157,6 +175,19 @@ class SqliteBackend:
                    channel_name TEXT DEFAULT '',
                    message_link TEXT DEFAULT '',
                    matched_date REAL NOT NULL
+               )''',
+            # Counters only — never one row per alert. See the note on the Postgres
+            # copy of this table for why.
+            '''CREATE TABLE IF NOT EXISTS channel_stats (
+                   channel_id INTEGER PRIMARY KEY,
+                   alerts INTEGER NOT NULL DEFAULT 0,
+                   up INTEGER NOT NULL DEFAULT 0,
+                   down INTEGER NOT NULL DEFAULT 0,
+                   alerts_at_report INTEGER NOT NULL DEFAULT 0,
+                   up_at_report INTEGER NOT NULL DEFAULT 0,
+                   down_at_report INTEGER NOT NULL DEFAULT 0,
+                   last_alert_at REAL DEFAULT 0,
+                   last_report_at REAL DEFAULT 0
                )''',
             'CREATE INDEX IF NOT EXISTS idx_deals_matched_date ON matched_deals(matched_date)',
             'CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(active)',
@@ -355,6 +386,15 @@ class PostgresBackend:
         """No-op — Postgres autovacuum handles reclamation."""
         return
 
+    async def add_column_if_missing(self, table, column, definition):
+        """Additive migration. Postgres has this natively, so it is a one-liner."""
+        async def op(conn):
+            await conn.execute(
+                f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}')
+            return True
+
+        return await self._run(op)
+
     def schema(self):
         # BIGINT for channel_id is not optional: Telegram channel IDs routinely exceed
         # the 32-bit range, and INTEGER in Postgres really is 32-bit (unlike SQLite's,
@@ -384,6 +424,25 @@ class PostgresBackend:
                    channel_name TEXT DEFAULT '',
                    message_link TEXT DEFAULT '',
                    matched_date DOUBLE PRECISION NOT NULL
+               )''',
+            # Per-channel COUNTERS, not an alert log. NDT deliberately keeps no
+            # history of alerts — matched_deals is a 7-day dedup ledger that gets
+            # pruned, so anything that has to survive longer (how a channel has
+            # performed, how its alerts were rated) is kept as running totals. This
+            # table therefore stays at one row per channel no matter how many alerts
+            # are sent, which is also what makes it free to keep forever.
+            #   *_at_report are snapshots taken when a report is sent, so the next
+            #   report can show the delta without storing anything per alert.
+            '''CREATE TABLE IF NOT EXISTS channel_stats (
+                   channel_id BIGINT PRIMARY KEY,
+                   alerts INTEGER NOT NULL DEFAULT 0,
+                   up INTEGER NOT NULL DEFAULT 0,
+                   down INTEGER NOT NULL DEFAULT 0,
+                   alerts_at_report INTEGER NOT NULL DEFAULT 0,
+                   up_at_report INTEGER NOT NULL DEFAULT 0,
+                   down_at_report INTEGER NOT NULL DEFAULT 0,
+                   last_alert_at DOUBLE PRECISION DEFAULT 0,
+                   last_report_at DOUBLE PRECISION DEFAULT 0
                )''',
             'CREATE INDEX IF NOT EXISTS idx_deals_matched_date ON matched_deals(matched_date)',
             'CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(active)',

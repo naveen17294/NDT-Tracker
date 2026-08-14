@@ -6,6 +6,13 @@ from storage import build_backend
 
 logger = logging.getLogger(__name__)
 
+# Columns added to tables that already exist in deployed databases. CREATE TABLE IF
+# NOT EXISTS silently does nothing for a table that is already there, so a new column
+# needs its own additive step — see backend.add_column_if_missing().
+_COLUMN_MIGRATIONS = [
+    ('watchlist', 'exclusions', "TEXT DEFAULT ''"),
+]
+
 
 class Database:
     """
@@ -43,6 +50,9 @@ class Database:
             return
         self.db_path = DB_PATH
         self.backend = build_backend(DATABASE_URL, DB_PATH)
+        # Cleared if the exclusions migration did not take, so the matcher falls back
+        # to plain matching instead of erroring on every message.
+        self._has_exclusions = True
         self._ready = True
 
     @classmethod
@@ -59,19 +69,28 @@ class Database:
         await self.backend.close()
 
     async def init(self):
-        """Create tables and indexes if they don't exist."""
+        """Create tables and indexes if they don't exist, then apply additive migrations."""
         await self.backend.execute_many_ddl(self.backend.schema())
+        for table, column, definition in _COLUMN_MIGRATIONS:
+            try:
+                if await self.backend.add_column_if_missing(table, column, definition):
+                    logger.info(f"Migration: added {table}.{column}")
+            except Exception as e:
+                # A failed migration must not stop the bot from booting — the feature
+                # that needs the column degrades, everything else keeps working.
+                logger.error(f"Migration for {table}.{column} failed: {e}")
         logger.info(f"Database ready (backend={self.backend.name})")
 
     # ── Watchlist Operations ──
 
-    async def add_keyword(self, keyword, custom_synonyms=''):
+    async def add_keyword(self, keyword, custom_synonyms='', exclusions=''):
         """Add a keyword to the watchlist. False if it was already there."""
         affected = await self.backend.execute(
-            '''INSERT INTO watchlist (keyword, custom_synonyms, added_date)
-               VALUES (?, ?, ?)
+            '''INSERT INTO watchlist (keyword, custom_synonyms, exclusions, added_date)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT (keyword) DO NOTHING''',
-            (keyword.lower().strip(), custom_synonyms.lower().strip(), time.time())
+            (keyword.lower().strip(), custom_synonyms.lower().strip(),
+             (exclusions or '').lower().strip(), time.time())
         )
         return affected > 0
 
@@ -80,6 +99,14 @@ class Database:
         affected = await self.backend.execute(
             'UPDATE watchlist SET custom_synonyms = ? WHERE keyword = ?',
             (custom_synonyms.lower().strip(), keyword.lower().strip())
+        )
+        return affected > 0
+
+    async def update_exclusions(self, keyword, exclusions):
+        """Set the negative keywords for an existing keyword. '' clears them."""
+        affected = await self.backend.execute(
+            'UPDATE watchlist SET exclusions = ? WHERE keyword = ?',
+            ((exclusions or '').lower().strip(), keyword.lower().strip())
         )
         return affected > 0
 
@@ -98,11 +125,29 @@ class Database:
         )
 
     async def get_all_keywords(self):
-        """Get just the keyword strings, as (keyword, custom_synonyms) tuples."""
+        """
+        The watchlist as (keyword, custom_synonyms, exclusions) tuples.
+
+        This is what the matcher consumes on every incoming message. It grew a third
+        element for negative keywords; KeywordMatcher.match() unpacks defensively so
+        a plain 2-tuple still works.
+        """
+        if self._has_exclusions:
+            try:
+                rows = await self.backend.fetch_all(
+                    'SELECT keyword, custom_synonyms, exclusions FROM watchlist')
+                return [(row['keyword'], row['custom_synonyms'] or '',
+                         row['exclusions'] or '') for row in rows]
+            except Exception as e:
+                # The migration is non-fatal by design, so the column can genuinely be
+                # absent. Degrade to matching without exclusions rather than throwing
+                # on every single incoming message.
+                logger.error(f"exclusions column unavailable, disabling it: {e}")
+                self._has_exclusions = False
+
         rows = await self.backend.fetch_all(
-            'SELECT keyword, custom_synonyms FROM watchlist'
-        )
-        return [(row['keyword'], row['custom_synonyms']) for row in rows]
+            'SELECT keyword, custom_synonyms FROM watchlist')
+        return [(row['keyword'], row['custom_synonyms'] or '', '') for row in rows]
 
     # ── Channel Operations ──
 
@@ -117,11 +162,13 @@ class Database:
         return affected > 0
 
     async def remove_channel(self, channel_id):
-        """Remove a channel from monitoring."""
+        """Remove a channel from monitoring, and its counters with it."""
         affected = await self.backend.execute(
             'DELETE FROM channels WHERE channel_id = ?',
             (channel_id,)
         )
+        await self.backend.execute(
+            'DELETE FROM channel_stats WHERE channel_id = ?', (channel_id,))
         return affected > 0
 
     async def toggle_channel(self, channel_id):
@@ -219,6 +266,88 @@ class Database:
         if deleted > 0:
             await self.backend.maintenance()
         return deleted
+
+    # ── Channel counters ──
+    #
+    # NDT keeps no history of alerts: matched_deals is a dedup ledger pruned after
+    # DEAL_RETENTION_DAYS, so it cannot answer "how has this channel done for me".
+    # These are running totals instead — one row per channel, forever, regardless of
+    # how many alerts pass through. Nothing here grows with alert volume.
+
+    async def record_alert(self, channel_id, when=None):
+        """Count one alert actually delivered from this channel."""
+        if channel_id is None:
+            return False
+        now = time.time() if when is None else when
+        await self.backend.execute(
+            '''INSERT INTO channel_stats (channel_id, alerts, last_alert_at)
+               VALUES (?, 1, ?)
+               ON CONFLICT (channel_id) DO UPDATE
+                   SET alerts = alerts + 1, last_alert_at = excluded.last_alert_at''',
+            (channel_id, now)
+        )
+        return True
+
+    async def record_feedback(self, channel_id, is_good):
+        """
+        Count one 👍 or 👎 against the channel the alert came from.
+
+        Deliberately attributed to the CHANNEL, not the alert. The vote arrives with
+        the channel id carried in the button's callback data, so nothing about the
+        individual alert needs to have been stored for this to work.
+        """
+        if channel_id is None:
+            return False
+        column = 'up' if is_good else 'down'
+        await self.backend.execute(
+            f'''INSERT INTO channel_stats (channel_id, {column})
+                VALUES (?, 1)
+                ON CONFLICT (channel_id) DO UPDATE SET {column} = {column} + 1''',
+            (channel_id,)
+        )
+        return True
+
+    async def get_channel_report(self):
+        """
+        Per-channel totals for active channels, plus the delta since the last report.
+
+        Deltas come from the *_at_report snapshot columns, which is what lets the
+        8-hourly report say "since last time" without keeping any per-alert rows.
+        """
+        rows = await self.backend.fetch_all(
+            '''SELECT c.channel_id       AS channel_id,
+                      c.channel_name     AS channel_name,
+                      c.channel_username AS channel_username,
+                      COALESCE(s.alerts, 0)           AS alerts,
+                      COALESCE(s.up, 0)               AS up,
+                      COALESCE(s.down, 0)             AS down,
+                      COALESCE(s.alerts_at_report, 0) AS alerts_at_report,
+                      COALESCE(s.up_at_report, 0)     AS up_at_report,
+                      COALESCE(s.down_at_report, 0)   AS down_at_report,
+                      COALESCE(s.last_alert_at, 0)    AS last_alert_at,
+                      COALESCE(s.last_report_at, 0)   AS last_report_at
+               FROM channels c
+               LEFT JOIN channel_stats s ON s.channel_id = c.channel_id
+               WHERE c.active = 1'''
+        )
+        for row in rows:
+            row['new_alerts'] = row['alerts'] - row['alerts_at_report']
+            row['new_up'] = row['up'] - row['up_at_report']
+            row['new_down'] = row['down'] - row['down_at_report']
+        rows.sort(key=lambda r: (-r['new_alerts'], -r['alerts']))
+        return rows
+
+    async def snapshot_channel_report(self, when=None):
+        """Mark the current totals as reported, so the next report shows a fresh delta."""
+        now = time.time() if when is None else when
+        return await self.backend.execute(
+            '''UPDATE channel_stats
+                  SET alerts_at_report = alerts,
+                      up_at_report = up,
+                      down_at_report = down,
+                      last_report_at = ?''',
+            (now,)
+        )
 
     # ── Stats ──
 

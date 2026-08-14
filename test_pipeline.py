@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 
 # Point config at a throwaway directory before importing it — importing config
@@ -339,7 +340,14 @@ async def test_database_shared_connection_and_retention():
     check('DB reuses one connection', conn_first is conn_second)
 
     kws = await db.get_all_keywords()
-    check('keyword round-trips', ('fridge', 'samsung') in kws, f'got {kws}')
+    # (keyword, custom_synonyms, exclusions) — the third element arrived with
+    # negative keywords.
+    check('keyword round-trips', ('fridge', 'samsung', '') in kws, f'got {kws}')
+
+    await db.update_exclusions('fridge', 'mini, used')
+    kws = await db.get_all_keywords()
+    check('exclusions round-trip', ('fridge', 'samsung', 'mini, used') in kws,
+          f'got {kws}')
 
     # Duplicate insert must report "already there" rather than raising.
     again = await db.add_keyword('fridge', 'samsung')
@@ -763,6 +771,226 @@ async def test_channel_list_is_filtered_to_deal_channels():
         bot.monitor, bot.db = saved_monitor, saved_db
 
 
+async def test_negative_keywords_block_a_match():
+    """
+    A watchlist entry can carry exclusions. Any of them appearing in the message
+    vetoes THAT keyword — and only that keyword, so an unrelated watchlist entry
+    still matches the same message.
+    """
+    m = KeywordMatcher()
+
+    check('plain keyword still matches',
+          m.match('Nike Running Shoes Rs 1999', [('shoes', '', '')]) is not None)
+
+    blocked = m.match('Kids Running Shoes Rs 999', [('shoes', '', 'kids, women')])
+    check('excluded term blocks the match', blocked is None, f"got {blocked}")
+
+    allowed = m.match('Mens Running Shoes Rs 1999', [('shoes', '', 'kids, women')])
+    check('non-excluded message still matches', allowed is not None, f"got {allowed}")
+
+    # Plural/singular is handled, same as positive matching.
+    check('exclusion matches the singular form',
+          m.match('Kid Shoes Rs 999', [('shoes', '', 'kids')]) is None)
+
+    # Word boundaries, not substrings — the whole point of the v1.2.0 work.
+    check('exclusion does not fire on a substring',
+          m.match('Expensive Shoes Rs 4999', [('shoes', '', 'pen')]) is not None)
+
+    # Scoped per keyword.
+    both = m.match('Kids Shoes and a Gaming Laptop Rs 999',
+                   [('shoes', '', 'kids'), ('laptop', '', '')])
+    check('exclusion is scoped to its own keyword',
+          both is not None and both['keyword'] == 'laptop', f"got {both}")
+
+    # Old 2-tuple watchlists must keep working.
+    check('2-tuple watchlist entries still work',
+          m.match('Nike Shoes', [('shoes', '')]) is not None)
+
+    from keyword_matcher import parse_exclusions
+    check('exclusions parse from comma form',
+          parse_exclusions('kids, women , ') == ['kids', 'women'],
+          f"got {parse_exclusions('kids, women , ')}")
+
+    report, result = m.explain('Kids Running Shoes', [('shoes', '', 'kids')])
+    check('explain reports the veto',
+          result is None and 'BLOCKED keyword: shoes' in report and 'kids' in report,
+          f"got {report!r}")
+
+
+async def test_watch_command_parses_inline_negatives():
+    """`/watch shoes -kids -women` must not eat hyphenated words like 't-shirt'."""
+    try:
+        import bot
+    except ImportError as e:
+        check('inline negatives parse', True, f'(skipped, {e})')
+        return
+
+    rest, excl = bot.parse_negatives('shoes -kids -women')
+    check('inline negatives are extracted', rest == 'shoes' and excl == 'kids, women',
+          f"got {rest!r} / {excl!r}")
+
+    rest, excl = bot.parse_negatives('t-shirt -kids')
+    check('hyphenated keywords survive', rest == 't-shirt' and excl == 'kids',
+          f"got {rest!r} / {excl!r}")
+
+    rest, excl = bot.parse_negatives('laptop | gaming, macbook -refurbished')
+    check('negatives coexist with the | synonym form',
+          rest == 'laptop | gaming, macbook' and excl == 'refurbished',
+          f"got {rest!r} / {excl!r}")
+
+    rest, excl = bot.parse_negatives('fridge')
+    check('no negatives means none', rest == 'fridge' and excl == '',
+          f"got {rest!r} / {excl!r}")
+
+
+async def test_channel_counters_survive_deal_pruning():
+    """
+    The whole point of channel_stats: NDT keeps no history of alerts, so per-channel
+    quality has to be running totals. Pruning every deal row must not touch them.
+    """
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'counters.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    await db.add_channel(4242, 'Loot Deals', 'lootdeals')
+    await db.toggle_channel(4242)  # make it active
+
+    for i in range(3):
+        await db.record_alert(4242)
+        await db.save_deal(f'hash-{i}', 'shoes', f'Product {i}', '999', 'Loot Deals')
+    await db.record_feedback(4242, True)
+    await db.record_feedback(4242, True)
+    await db.record_feedback(4242, False)
+
+    # Age every deal row out, then prune — the counters must be untouched.
+    await db.backend.execute('UPDATE matched_deals SET matched_date = 0')
+    deleted = await db.cleanup_old_deals(days=1)
+    check('deal rows were pruned', deleted == 3, f"deleted {deleted}")
+
+    rows = await db.get_channel_report()
+    check('one row per channel, not per alert', len(rows) == 1, f"got {len(rows)} rows")
+    row = rows[0]
+    check('alert counter survived pruning', row['alerts'] == 3, f"got {row['alerts']}")
+    check('feedback counters survived', (row['up'], row['down']) == (2, 1),
+          f"got {row['up']}/{row['down']}")
+    check('first report shows the full delta', row['new_alerts'] == 3,
+          f"got {row['new_alerts']}")
+
+    # After a report, the delta resets but lifetime totals do not.
+    await db.snapshot_channel_report()
+    await db.record_alert(4242)
+    row = (await db.get_channel_report())[0]
+    check('delta resets after a report', row['new_alerts'] == 1, f"got {row['new_alerts']}")
+    check('lifetime total keeps counting', row['alerts'] == 4, f"got {row['alerts']}")
+
+    # Untracked channels drop out of the report.
+    await db.toggle_channel(4242)
+    check('inactive channels are not reported', await db.get_channel_report() == [])
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+async def test_channel_report_renders():
+    try:
+        import bot
+    except ImportError as e:
+        check('channel report renders', True, f'(skipped, {e})')
+        return
+
+    now = 1_000_000.0
+    rows = [
+        {'channel_id': 1, 'channel_name': 'Loot Deals', 'channel_username': 'loot',
+         'alerts': 40, 'up': 9, 'down': 1, 'new_alerts': 12, 'new_up': 3,
+         'new_down': 0, 'last_alert_at': now - 100, 'last_report_at': 0},
+        {'channel_id': 2, 'channel_name': 'Junk & Co <b>', 'channel_username': 'junk',
+         'alerts': 20, 'up': 0, 'down': 7, 'new_alerts': 4, 'new_up': 0,
+         'new_down': 3, 'last_alert_at': now - 100, 'last_report_at': 0},
+        {'channel_id': 3, 'channel_name': 'Dead Channel', 'channel_username': 'dead',
+         'alerts': 2, 'up': 0, 'down': 0, 'new_alerts': 0, 'new_up': 0,
+         'new_down': 0, 'last_alert_at': now - 40 * 86400, 'last_report_at': 0},
+    ]
+    report = bot.build_channel_report(rows, now=now)
+
+    check('report counts the window', '16 alert(s) since' in report, f"got {report!r}")
+    check('good channel is starred', '⭐ good' in report, f"got {report!r}")
+    check('junk channel is flagged', 'mostly junk' in report, f"got {report!r}")
+    check('quiet channel is flagged', 'quiet 40d' in report, f"got {report!r}")
+    check('channel names are HTML-escaped', '&lt;b&gt;' in report, f"got {report!r}")
+
+    empty = bot.build_channel_report([], now=now)
+    check('empty report explains itself', '/channels' in empty, f"got {empty!r}")
+
+    unrated = bot.build_channel_report(
+        [dict(rows[0], up=0, down=0)], now=now)
+    check('unrated report nudges toward rating', '👍/👎' in unrated, f"got {unrated!r}")
+
+
+async def test_report_schedule_survives_restarts():
+    """
+    The 8-hour timer is measured from last_report_at in the database. A plain
+    sleep(interval) loop would be reset by every container restart, and on a free
+    tier that recycles often it would never reach 8 hours.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('report schedule survives restarts', True, f'(skipped, {e})')
+        return
+
+    interval = 8 * 3600
+
+    class _Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def get_channel_report(self):
+            return self.rows
+
+    saved = bot.db
+    try:
+        bot.db = _Rows([])
+        check('never reported waits a full window',
+              await bot._seconds_until_next_report(interval) == interval)
+
+        # Reported 6 hours ago: a restart must resume with ~2 hours left, not 8.
+        bot.db = _Rows([{'last_report_at': time.time() - 6 * 3600}])
+        remaining = await bot._seconds_until_next_report(interval)
+        check('a restart resumes mid-window', 7100 < remaining < 7300,
+              f"got {remaining}")
+
+        # Overdue (or a send that failed and left the timestamp alone) — retry soon,
+        # but not in a tight loop.
+        bot.db = _Rows([{'last_report_at': time.time() - 99 * 3600}])
+        check('overdue reports retry soon',
+              await bot._seconds_until_next_report(interval) == 300)
+    finally:
+        bot.db = saved
+
+
+async def test_feedback_keyboard_fits_telegrams_limit():
+    from notifier import feedback_keyboard
+
+    # A real Telegram channel id, at the long end of the range.
+    markup = feedback_keyboard(-1001234567890)
+    buttons = markup.inline_keyboard[0]
+    check('both vote buttons are offered', len(buttons) == 2, f"got {len(buttons)}")
+    check('callback data stays under 64 bytes',
+          all(len(b.callback_data.encode()) <= 64 for b in buttons),
+          f"got {[b.callback_data for b in buttons]}")
+
+    # Round-trip the parse bot.py does, including the negative id.
+    data = buttons[1].callback_data
+    _, verdict, raw_id = data.split('_', 2)
+    check('negative channel ids round-trip',
+          verdict == 'd' and int(raw_id) == -1001234567890, f"got {data!r}")
+
+    check('no channel id means no buttons', feedback_keyboard(None) is None)
+
+
 async def main():
     tests = [
         test_main_installs_an_event_loop,
@@ -787,6 +1015,12 @@ async def main():
         test_synonym_order_is_deterministic_and_specific,
         test_singularise_keeps_words_distinct,
         test_channel_list_is_filtered_to_deal_channels,
+        test_negative_keywords_block_a_match,
+        test_watch_command_parses_inline_negatives,
+        test_channel_counters_survive_deal_pruning,
+        test_channel_report_renders,
+        test_report_schedule_survives_restarts,
+        test_feedback_keyboard_fits_telegrams_limit,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

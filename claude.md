@@ -17,9 +17,9 @@ deduplicate → alert.
 
 ## Commands
 
-`/watch` `/unwatch` `/updatesynonyms` `/watchlist` — keywords.
+`/watch` `/unwatch` `/updatesynonyms` `/exclude` `/watchlist` — keywords.
 `/channels` `/searchchannel` `/addchannel` `/untrackchannel` — sources.
-`/deals` `/stats` `/pause` `/resume` — status.
+`/deals` `/stats` `/channelreport` `/pause` `/resume` — status.
 `/testmatch <text>` `/synonyms <keyword>` — **debug matching**; reach for these
 first, since a wrong match is indistinguishable from a right one from outside.
 
@@ -48,6 +48,18 @@ matching, so `tv` can't match inside `amzn.to/u5tv2`. Tiers: `exact` > `synonym`
 
 `get_synonyms()` returns a **sorted** list. It once returned `list(set(...))`, and
 Python randomises string hashing per process, so `matched_term` changed per restart.
+
+**Negative keywords.** A watchlist row carries `exclusions`; any of those terms in the
+message vetoes that keyword before any synonym is tried. Scoped to the one keyword on
+purpose — `/watch shoes -kids` must not stop `laptop` matching the same message. They
+use the same word-boundary + singularise machinery as a positive match (so `-kids`
+blocks "kid", and `-pen` cannot veto "expensive"), and are never synonym-expanded:
+naming a term to block means that term, not its category. `/testmatch` prints
+`BLOCKED keyword: …` when a veto fired, because a suppressed alert is otherwise
+indistinguishable from one that never matched.
+
+`match()` unpacks watchlist entries as `entry[0], entry[1], entry[2] if len > 2` —
+2-tuples still work, which is what lets old call sites and tests keep passing.
 
 ## 2. Product name & scraping (`channel_monitor.py`, `link_scraper.py`)
 
@@ -98,7 +110,38 @@ not raw text, so the same deal reposted with a new affiliate link is dropped.
 Alerts are HTML (not MarkdownV2) with `html.escape()`, so odd characters can't
 break delivery.
 
-## 5. Persistence
+## 5. Feedback & the channel report
+
+> ⚠️ **NDT keeps no history of alerts. Do not add one.** `matched_deals` is a dedup
+> ledger pruned after `DEAL_RETENTION_DAYS`, so nothing per-alert survives a week —
+> and nothing should. Anything that must outlive that is a **counter**, not a row.
+
+`channel_stats` is one row per channel, forever, no matter how many alerts pass
+through: `alerts`, `up`, `down`, plus `*_at_report` snapshots. The 8-hourly report
+subtracts the snapshot to get "since last time" and then re-snapshots, which is how
+it shows a delta without storing anything per alert.
+
+Every alert carries 👍/👎 with the **channel id in the button's `callback_data`**.
+That is the mechanism, not a shortcut: the vote is attributable when pressed, so no
+record of the alert has to exist. On a vote the keyboard is replaced with a static
+receipt — the message's own markup is the only thing preventing a double vote, again
+because there is no row to check against.
+
+`record_alert()` is called only when the notifier reports the alert actually went
+out. Counting before that inflates a channel's total with in-window duplicates you
+never saw.
+
+Ordering that matters: `_send_channel_report()` snapshots **after** a successful
+send, so a failed send leaves the window intact for the next report instead of
+silently eating it.
+
+> ⚠️ **The report schedule is measured from `last_report_at` in the database, not
+> from process start.** A plain `sleep(8h)` loop is reset by every restart, and this
+> runs on a free tier that recycles containers — the timer would never reach 8 hours.
+> The same property makes a failed send retry (the timestamp did not move) instead of
+> skipping the window.
+
+## 6. Persistence
 
 `storage.py` picks a backend from `DATABASE_URL`: Postgres when set, SQLite
 otherwise. `database.py`'s API is identical either way. Postgres exists because a
@@ -114,6 +157,14 @@ Rules when touching SQL — it is written once in `?` style and translated to `$
 - `channels.channel_id` is **BIGINT** on Postgres, not optional: Telegram IDs
   exceed 32 bits and Postgres `INTEGER` really is 32-bit, unlike SQLite's.
 - `PRAGMA` is SQLite-only — it lives behind `backend.maintenance()`.
+- **A new column on an existing table needs a migration, not just a schema edit.**
+  `CREATE TABLE IF NOT EXISTS` does nothing for a table that already exists, so a
+  deployed database never gets the column. Add it to `_COLUMN_MIGRATIONS` in
+  `database.py`; `backend.add_column_if_missing()` handles the split (Postgres has
+  `ADD COLUMN IF NOT EXISTS`, SQLite has to read `PRAGMA table_info` first, because
+  re-running a bare `ALTER TABLE` errors and would take the whole boot with it).
+  Migrations are logged but never fatal — `get_all_keywords()` falls back to
+  selecting without `exclusions` rather than throwing on every incoming message.
 
 > ⚠️ **Serverless Postgres (Neon) suspends when idle.** Without accommodating that,
 > the bot works and then quietly stops recording deals. `DB_POOL_MIN_SIZE=0` holds
@@ -124,7 +175,7 @@ Rules when touching SQL — it is written once in `?` style and translated to `$
 Tools: `check_db.py` (verify a database before deploying), `migrate_to_postgres.py`
 (copy an existing SQLite file across; idempotent, deletes nothing).
 
-## 6. Memory management
+## 7. Memory management
 
 Long-lived process on a small container — anything per-message compounds.
 
@@ -141,7 +192,7 @@ Long-lived process on a small container — anything per-message compounds.
 - One shared `aiohttp.ClientSession` (was a new TLS context per URL), page reads
   capped via streaming, `soup.decompose()` to break BeautifulSoup's cycles.
 
-## 7. Startup
+## 8. Startup
 
 > ⚠️ **`main()`'s `asyncio.set_event_loop()` block looks like dead code and is not.**
 > python-telegram-bot 21.x calls `asyncio.get_event_loop()` inside `run_polling()`.
@@ -156,7 +207,8 @@ Long-lived process on a small container — anything per-message compounds.
 
 ## Tests
 
-`python test_pipeline.py` — offline, no credentials or network. 116 assertions
+`python test_pipeline.py` — offline, no credentials or network. 165 assertions
 covering the `WebPagePending` retry, both preview API shapes, the lookalike-word
-false positives, category leakage, cache bounds, Postgres retry/translation, and
-the event-loop shim.
+false positives, category leakage, negative-keyword vetoes, channel counters
+surviving a deal prune, cache bounds, Postgres retry/translation, and the
+event-loop shim.

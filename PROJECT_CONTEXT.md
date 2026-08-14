@@ -19,6 +19,11 @@ Release history: `CHANGELOG.md`.
 - **Synonym matching** — built-in dictionary across ~40 Indian e-commerce
   categories (`fridge` → `refrigerator`, `double door`, …), plus custom synonyms
   and singular/plural handling.
+- **Negative keywords** — `/watch shoes -kids -women` never alerts on a message
+  containing a blocked term.
+- **Rate your alerts** — 👍/👎 on every alert feeds `/channelreport`, a digest every
+  8 hours of which channels are worth keeping. Both run on per-channel counters;
+  no history of individual alerts is kept.
 - **Product names from Telegram previews** — Telegram's servers already got past
   Amazon and Flipkart's bot protection, so previews are used before any scraping.
 - **Price extraction** — `₹1,999`, `Rs 2,999`, `MRP ₹3,999`, `50% off`.

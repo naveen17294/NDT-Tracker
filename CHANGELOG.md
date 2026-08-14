@@ -2,6 +2,31 @@
 
 Why each change exists is in `claude.md`; how to deploy is in `DEPLOYMENT.md`.
 
+## v1.4.0
+
+**Negative keywords.** `/watch shoes -kids -women`, or `/exclude shoes | kids, women`
+on an existing keyword. A message containing a blocked term never alerts for that
+keyword, even when it matches otherwise — scoped per keyword, so blocking terms on
+`shoes` cannot suppress `laptop` in the same message. `/testmatch` now prints
+`BLOCKED keyword: …` when a veto fired, since a suppressed alert would otherwise look
+identical to one that never matched.
+
+**👍/👎 on every alert.** One tap rates the channel the deal came from. The channel id
+travels in the button itself, so rating needs nothing about the alert to have been
+stored — the message's own keyboard is what stops a double vote.
+
+**`/channelreport`, and every 8 hours automatically.** Which tracked channels are
+actually earning their place: new alerts since the last report, lifetime totals, your
+👍/👎, and a flag on channels that are mostly junk or have gone quiet.
+
+Both features work from per-channel **counters** (`channel_stats`), never an alert
+log — NDT keeps no history of alerts, and `matched_deals` is pruned weekly. One row
+per channel, whatever the alert volume.
+
+**Schema.** `watchlist.exclusions` and the `channel_stats` table. The column is added
+by an additive migration, so an already-deployed database picks it up on next boot
+with no data loss.
+
 ## v1.3.0
 
 **`/channels` was unusable at real scale.** It listed every broadcast channel the

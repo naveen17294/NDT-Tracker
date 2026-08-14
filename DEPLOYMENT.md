@@ -50,6 +50,12 @@ In order — this isolates failures instead of guessing:
 3. `/watch shoes`, then **Manual Deploy → Restart**, then `/watchlist`. If the
    keyword survives, persistence works.
 4. `/testmatch Home decor for homes Rs 499` → must say **WOULD NOT ALERT**.
+5. `/channelreport` → answers (empty until alerts have been sent).
+
+A schema change ships with this release. Watch the logs for
+`Migration: added watchlist.exclusions` on first boot — it is additive and keeps
+existing rows. `Migration for … failed` means negative keywords are inert while
+everything else keeps working.
 
 ## Failure signatures
 
@@ -61,6 +67,8 @@ In order — this isolates failures instead of guessing:
 | Watchlist empty after a restart | On SQLite, not Postgres. Check for `backend=postgres` in the logs |
 | Bot answers but never alerts | `telethon_connected: false`, or no channels selected — run `/channels` |
 | A channel you joined is missing from `/channels` | Its name has no `deal`/`sale` in it. Find it with `/searchchannel <text>`, or widen `CHANNEL_NAME_FILTERS` |
+| A keyword stopped alerting | Check `/watchlist` for a 🚫 line, then `/testmatch <message>` — it prints `BLOCKED keyword:` when a negative keyword vetoed the match |
+| Channel report never arrives | `CHANNEL_REPORT_ENABLED=false`, or no channel is active. The schedule is stored in the database, so restarts do not reset it. `/channelreport` works on demand regardless |
 | `retry 1/2` then success in logs | Normal. Neon suspends when idle and briefly refuses the first connection while waking |
 | `👋 NDT shut down cleanly` | Normal. Every deploy and restart logs this. A real failure shows a traceback |
 
