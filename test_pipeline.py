@@ -73,6 +73,13 @@ def check(name, condition, detail=''):
         print(_safe(f"  FAIL  {name} {detail}"))
 
 
+def _source(filename):
+    """A module's own source, for the few checks that are about wiring, not output."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    with open(path, encoding='utf-8') as handle:
+        return handle.read()
+
+
 # ── Fakes ───────────────────────────────────────────────────────────────────
 
 def make_webpage(title, description=''):
@@ -987,24 +994,599 @@ async def test_report_schedule_survives_restarts():
         bot.db = saved
 
 
-async def test_feedback_keyboard_fits_telegrams_limit():
-    from notifier import feedback_keyboard
+async def test_product_key_survives_affiliate_rewriting():
+    """
+    The root cause of the duplicates: one product, many links.
 
-    # A real Telegram channel id, at the long end of the range.
-    markup = feedback_keyboard(-1001234567890)
+    Each channel rewrites the same item with its own affiliate tag, so nothing about
+    the URL string is stable. The seller's own product id is.
+    """
+    import product_key as pkey
+
+    # The same TV, as three channels would post it.
+    variants = [
+        'https://www.amazon.in/dp/B0CX23V2ZK?tag=channel-a-21&psc=1',
+        'https://amazon.in/Samsung-Crystal-4K-Ultra-HD/dp/B0CX23V2ZK/ref=sr_1_3?tag=b-21',
+        'https://www.amazon.in/gp/product/B0CX23V2ZK?ie=UTF8&tag=third-21&linkCode=xm2',
+    ]
+    keys = {pkey.canonical_key(u) for u in variants}
+    check('every affiliate variant collapses to one key',
+          keys == {'amazon:B0CX23V2ZK'}, f"got {keys}")
+
+    # A genuinely different product must not collide.
+    other = pkey.canonical_key('https://www.amazon.in/dp/B0DIFFEREN?tag=a-21')
+    check('a different ASIN is a different key', other == 'amazon:B0DIFFEREN',
+          f"got {other!r}")
+
+    # An ASIN is exactly ten characters. Anything else in that slot is not one, and
+    # must not be accepted as a product identity — otherwise unrelated pages would
+    # dedup against each other and the second deal would be silently swallowed.
+    check('an 11-character slug is not an ASIN',
+          pkey.canonical_key('https://www.amazon.in/dp/B0TOOLONG12') is None,
+          f"got {pkey.canonical_key('https://www.amazon.in/dp/B0TOOLONG12')!r}")
+    check('a 9-character slug is not an ASIN',
+          pkey.canonical_key('https://www.amazon.in/dp/B0TOOSHRT') is None)
+
+    # Flipkart: pid is authoritative and survives the rest of the query soup.
+    fk = {
+        pkey.canonical_key('https://www.flipkart.com/x/p/itm9a8b7c?pid=TVSGHZ8&affid=abc'),
+        pkey.canonical_key('https://dl.flipkart.com/y/p/itmZZZZ?pid=TVSGHZ8&lid=LSTx&fm=neo'),
+    }
+    check('flipkart pid wins over the path slug', fk == {'flipkart:tvsghz8'}, f"got {fk}")
+
+    # A search page or a bare storefront identifies no product.
+    check('a search url is not a product',
+          pkey.canonical_key('https://www.amazon.in/s?k=tv&tag=a-21') is None)
+
+    # Unknown sites still normalise: tracking stripped, ordering stable.
+    a = pkey.canonical_key('https://croma.com/p/12345?utm_source=tg&x=1')
+    b = pkey.canonical_key('https://www.croma.com/p/12345/?x=1&fbclid=zz')
+    check('unknown sites normalise consistently', a == b and a is not None,
+          f"got {a!r} vs {b!r}")
+
+    # The www-stripping must not eat real hostnames — str.lstrip('www.') would turn
+    # 'wow.com' into 'ow.com'.
+    check('a host starting with w is intact',
+          'wow.com' in (pkey.canonical_key('https://wow.com/p/1') or ''),
+          f"got {pkey.canonical_key('https://wow.com/p/1')!r}")
+
+    # A shortener carries no id, so it must be resolved before canonicalising.
+    check('a shortener is not canonicalised',
+          pkey.canonical_key('https://amzn.to/3xYzAbC') == 'url:amzn.to/3xyzabc')
+    check('shorteners are detected',
+          pkey.is_shortener('https://amzn.to/3xYzAbC', ['amzn.to', 'bit.ly']))
+
+
+async def test_the_same_deal_from_two_channels_alerts_once():
+    """
+    The duplicate that actually reaches you.
+
+    Both tracked channels post one product, minutes apart, each with its own
+    affiliate link and its own marketing copy. The old hash was built from the
+    message text, so it differed every time and both got through.
+    """
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'crosschannel.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    monitor = ChannelMonitor.__new__(ChannelMonitor)  # no Telegram connection needed
+
+    # Channel A and channel B, same TV, different link and different blurb.
+    hash_a = monitor._generate_deal_hash(
+        '🔥🔥 SAMSUNG 55 INCH SMART TV LOWEST EVER 🔥🔥', 41999, 'tv',
+        product_key='amazon:B0CX23V2ZK')
+    hash_b = monitor._generate_deal_hash(
+        'Samsung Crystal 4K 55" — big price drop today only', 42999, 'tv',
+        product_key='amazon:B0CX23V2ZK')
+
+    check('both posts produce the same identity', hash_a == hash_b,
+          f"{hash_a} vs {hash_b}")
+
+    check('the first one is new', await db.is_deal_seen(hash_a) is False)
+    await db.save_deal(hash_a, 'tv', 'Samsung TV', '41999', '@channel_a')
+    check('the second one is recognised as seen', await db.is_deal_seen(hash_b) is True)
+
+    # A different product from the same channel must still get through.
+    hash_c = monitor._generate_deal_hash(
+        'Samsung 43 inch TV', 31999, 'tv', product_key='amazon:B0OTHERTV1')
+    check('a different product still alerts', await db.is_deal_seen(hash_c) is False)
+
+    # With no key at all it falls back to the old behaviour rather than colliding
+    # everything that has no link into one identity.
+    fallback_a = monitor._generate_deal_hash('Sony Headphones', 1999, 'headphones')
+    fallback_b = monitor._generate_deal_hash('Boat Headphones', 1999, 'headphones')
+    check('the fallback still separates different products',
+          fallback_a != fallback_b)
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+async def test_mirror_mutes_and_dedups():
+    """Bot 2's two filters: what you muted, and what you have already been shown."""
+    from mirror import Mirror
+
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'mirror.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    sent = []
+
+    class _Bot:
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+
+    m = Mirror(_Bot(), db, owner_id=1)
+    post = dict(text='Samsung 55 inch TV at a great price https://www.amazon.in/dp/B0CX23V2ZK',
+                urls=['https://www.amazon.in/dp/B0CX23V2ZK'],
+                channel_id=-100111, channel_name='LOOT DEALS',
+                product_keys=['amazon:B0CX23V2ZK'])
+
+    check('a fresh post is mirrored', await m.handle(**post) is True)
+    check('it actually sent one message', len(sent) == 1)
+
+    # The same product from the OTHER channel, different link, different words.
+    check('the same product from another channel is silent',
+          await m.handle(text='Big TV deal!! grab now',
+                         urls=['https://amzn.to/different'],
+                         channel_id=-100222, channel_name='DEALS SALE',
+                         product_keys=['amazon:B0CX23V2ZK']) is False)
+    check('still only one message went out', len(sent) == 1)
+
+    # Muting the product keeps it away even outside the dedup window.
+    await db.mute_product('amazon:B0OTHER', 'Some other TV')
+    check('a muted product is never mirrored',
+          await m.handle(text='Another TV', urls=['https://x.com/a'],
+                         channel_id=-100111, channel_name='LOOT DEALS',
+                         product_keys=['amazon:B0OTHER']) is False)
+
+    # Muting a word blocks a whole category, matched on whole words only.
+    await db.mute_term('saree')
+    m.invalidate_mutes()
+    check('a muted word blocks the post',
+          await m.handle(text='Beautiful silk saree collection',
+                         urls=['https://x.com/s1'], channel_id=-100111,
+                         channel_name='LOOT DEALS',
+                         product_keys=['amazon:B0SAREE001']) is False)
+    check('a muted word does not block a substring match',
+          await m.handle(text='Sareena brand shoes', urls=['https://x.com/s2'],
+                         channel_id=-100111, channel_name='LOOT DEALS',
+                         product_keys=['amazon:B0SHOES001']) is True)
+
+    # A post with nothing to open has no preview to show, which is the whole point.
+    check('a linkless post is skipped',
+          await m.handle(text='Channel announcement', urls=[],
+                         channel_id=-100111, channel_name='LOOT DEALS') is False)
+
+    # The dedup ledger is in the database, so a restart cannot resurrect a duplicate.
+    m2 = Mirror(_Bot(), db, owner_id=1)
+    check('dedup survives a restart',
+          await m2.handle(**post) is False)
+
+    # Mutes are decisions, not history — pruning the dedup ledger must not clear them.
+    await db.cleanup_mirror_seen(days=0)
+    check('mutes survive a prune', len(await db.get_muted_terms()) == 1)
+    check('muted products survive a prune',
+          len(await db.get_muted_products()) == 1)
+    check('the ledger itself was pruned', await db.is_mirror_seen('amazon:B0CX23V2ZK') is False)
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+class _FakeChat:
+    def __init__(self, title, username):
+        self.title = title
+        self.username = username
+
+
+class _FakeEvent:
+    """The bits of a Telethon NewMessage event that _handle_message touches."""
+
+    def __init__(self, chat_id, text, chat):
+        self.chat_id = chat_id
+        self.message = SimpleNamespace(message=text, id=555, media=None)
+        self._chat = chat
+
+    async def get_chat(self):
+        return self._chat
+
+
+async def _drive_one_message(db, text, watchlist, chat_id=-1001001):
+    """
+    Run a real message through ChannelMonitor._handle_message.
+
+    Returns (alerts, mirrored) — what each bot was handed.
+    """
+    from mirror import Mirror
+    from notifier import Notifier
+    from price_extractor import PriceExtractor
+
+    alerts, mirrored = [], []
+
+    class _Bot1:
+        async def send_message(self, **kwargs):
+            alerts.append(kwargs)
+
+    class _Bot2:
+        async def send_message(self, **kwargs):
+            mirrored.append(kwargs)
+
+    monitor = object.__new__(ChannelMonitor)
+    monitor.paused = False
+    monitor._monitored_channel_ids = {chat_id}
+    monitor.db = db
+    monitor.matcher = KeywordMatcher()
+    monitor.scraper = LinkScraper()
+    monitor.price_extractor = PriceExtractor()
+    monitor.notifier = Notifier(_Bot1())
+    monitor._watchlist_cache = watchlist
+    monitor._watchlist_cache_at = time.time()
+    monitor._preview_cache = __import__('collections').OrderedDict()
+    monitor._mirror_tasks = set()
+    monitor.mirror = Mirror(_Bot2(), db, owner_id=1)
+
+    await monitor._handle_message(
+        _FakeEvent(chat_id, text, _FakeChat('LOOT DEALS INDIA', 'lootdeals')))
+
+    # The mirror is deliberately detached, so wait for the task it spawned.
+    if monitor._mirror_tasks:
+        await asyncio.gather(*monitor._mirror_tasks, return_exceptions=True)
+    await monitor.scraper.close()
+    return alerts, mirrored
+
+
+async def test_both_bots_receive_one_message():
+    """
+    End to end, through the real handler: bot 1 filters, bot 2 mirrors.
+
+    This is the wiring that makes the two bots different, and it is the part a unit
+    test of either one alone cannot show.
+    """
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'bothbots.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    tv = ('Samsung 55 inch Crystal 4K TV at just Rs.41999 '
+          'https://www.amazon.in/dp/B0CX23V2ZK?tag=chan-a-21')
+
+    # ── A post that MATCHES the watchlist: both bots send it ──
+    alerts, mirrored = await _drive_one_message(db, tv, [('tv', '', '')])
+    check('bot 1 alerts on a watchlist match', len(alerts) == 1, f"got {len(alerts)}")
+    check('bot 2 mirrors it too', len(mirrored) == 1, f"got {len(mirrored)}")
+    check('bot 1 attaches no buttons', alerts[0].get('reply_markup') is None)
+    check('bot 2 attaches buttons', mirrored[0].get('reply_markup') is not None)
+
+    # ── A post that matches NOTHING: only bot 2 sends it ──
+    saree = 'Silk saree just Rs.899 https://www.amazon.in/dp/B0SAREE001?tag=x-21'
+    alerts, mirrored = await _drive_one_message(db, saree, [('tv', '', '')])
+    check('bot 1 stays quiet with no match', len(alerts) == 0, f"got {len(alerts)}")
+    check('bot 2 still mirrors it', len(mirrored) == 1, f"got {len(mirrored)}")
+
+    # ── An EMPTY watchlist must not silence bot 2 ──
+    shoes = 'Nike shoes Rs.2999 https://www.amazon.in/dp/B0SHOES0001?tag=x-21'
+    alerts, mirrored = await _drive_one_message(db, shoes, [])
+    check('bot 1 has nothing to match against', len(alerts) == 0)
+    check('bot 2 mirrors even with an empty watchlist', len(mirrored) == 1,
+          f"got {len(mirrored)}")
+
+    # ── The same product from the OTHER channel: both bots go quiet ──
+    repost = ('SAMSUNG 55" 4K SMART TV — LOWEST EVER Rs.42999 '
+              'https://www.amazon.in/dp/B0CX23V2ZK?tag=chan-b-21')
+    alerts, mirrored = await _drive_one_message(
+        db, repost, [('tv', '', '')], chat_id=-1002002)
+    check('bot 1 does not re-alert the same product', len(alerts) == 0,
+          f"got {len(alerts)}")
+    check('bot 2 does not re-mirror it either', len(mirrored) == 0,
+          f"got {len(mirrored)}")
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+async def test_mirror_is_independent_of_the_watchlist():
+    """
+    Bot 2 must send a post no keyword matches — that is the entire difference
+    between the two bots. The mirror therefore has to run BEFORE the watchlist
+    check in the monitor, or an empty watchlist would silence it completely.
+    """
+    source = _source('channel_monitor.py')
+    spawn = source.index('_spawn_mirror(')
+    watchlist_gate = source.index('watchlist = await self._get_watchlist()')
+    check('the mirror runs before the watchlist gate', spawn < watchlist_gate,
+          'the mirror is gated behind a keyword match')
+
+    # And it must not be awaited inline, or bot 1's alert waits on bot 2's throttle.
+    check('mirroring is detached from the alert path',
+          'asyncio.create_task(self._mirror_one' in source)
+    check('the task reference is held',
+          '_mirror_tasks.add(task)' in source)
+
+
+async def test_stats_explain_themselves():
+    """
+    The reported bug: statistics came back empty with no way to tell why.
+
+    A zero and a failed query rendered identically, and the screen said nothing
+    about which database it had read.
+    """
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'stats.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    stats = await db.get_stats()
+    check('the backend is named', stats['backend'] == 'sqlite', f"got {stats['backend']}")
+    check('the location is reported', stats['location'].endswith('stats.db'),
+          f"got {stats['location']}")
+    check('an empty install reads zero, not error', stats['watchlist_count'] == 0)
+    check('mirror counts are included',
+          'mirrored_24h' in stats and 'muted_products' in stats)
+    check('lifetime alerts come from the counters', stats['total_alerts'] == 0)
+
+    # A broken query must degrade to None for that metric only.
+    await db.backend.execute('DROP TABLE muted_terms')
+    stats = await db.get_stats()
+    check('a failed metric reports None', stats['muted_terms'] is None)
+    check('the other metrics still load', stats['watchlist_count'] == 0)
+
+    try:
+        import bot
+    except ImportError as e:
+        check('stats view renders', True, f'(skipped, {e})')
+    else:
+        check('None renders as an error, not a zero', bot._metric(None) == '⚠️ error')
+        check('a real zero still renders as zero', bot._metric(0) == '0')
+
+        saved = bot.db
+        try:
+            bot.db = db
+            text, _markup = await bot._render_stats()
+            problems = _html_problems(text, 'stats')
+            check('the status screen is valid Telegram HTML', not problems,
+                  '; '.join(problems))
+            check('it names the storage backend', 'sqlite' in text)
+            check('it warns about an ephemeral file', 'DATABASE_URL' in text)
+        finally:
+            bot.db = saved
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+async def test_the_muted_screen_can_undo_everything_it_lists():
+    """
+    A mute is permanent and taken on a single tap, so every one it shows must be
+    reversible — otherwise a mis-tapped 👎 hides a product for good with no way to
+    find out it happened.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('the muted screen offers undo', True, f'(skipped, {e})')
+        return
+
+    Database.reset_for_tests()
+    os.environ.pop('DATABASE_URL', None)
+    db = Database()
+    db.db_path = os.path.join(_TMP, 'mutedview.db')
+    db.backend = SqliteBackend(db.db_path)
+    await db.init()
+
+    saved = bot.db
+    try:
+        bot.db = db
+
+        text, markup = await bot._render_muted()
+        check('an empty mute list says so', 'Nothing muted' in text)
+        problems = _html_problems(text, 'muted (empty)')
+        check('the empty screen is valid HTML', not problems, '; '.join(problems))
+
+        await db.mute_term('saree')
+        await db.mute_product('amazon:B0CX23V2ZK', '🛒 Samsung 55" <TV> & more')
+        text, markup = await bot._render_muted()
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+
+        check('the muted word is listed', 'saree' in text)
+        check('the word can be unmuted', 'mu_t_saree' in data, f"got {data}")
+        check('the product can be unmuted', 'mu_p_amazon:B0CX23V2ZK' in data,
+              f"got {data}")
+        check('everything can be cleared at once', 'mu_clear' in data)
+        check('every button fits callback_data',
+              all(len(d.encode('utf-8')) <= 64 for d in data), f"got {data}")
+
+        # A product label comes from a channel post, so it is arbitrary text.
+        problems = _html_problems(text, 'muted')
+        check('a hostile product label cannot break the screen', not problems,
+              '; '.join(problems))
+        check('the label is escaped', '&lt;TV&gt;' in text and '&amp;' in text)
+    finally:
+        bot.db = saved
+
+    await db.close()
+    Database.reset_for_tests()
+
+
+async def test_a_bad_bot2_token_never_reaches_the_logs():
+    """
+    python-telegram-bot puts the rejected token inside its own error message, so
+    logging that exception verbatim would write BOT2_TOKEN into the host's logs in
+    plain text every time the mirror failed to start.
+    """
+    try:
+        import bot
+    except ImportError as e:
+        check('bot 2 token is scrubbed from logs', True, f'(skipped, {e})')
+        return
+
+    saved = bot.BOT2_TOKEN
+    try:
+        bot.BOT2_TOKEN = '123456789:AAFakeTokenValueForTesting_0123456789'
+        message = f"The token `{bot.BOT2_TOKEN}` was rejected by the server."
+        scrubbed = bot._scrub_token(message)
+        check('the configured token is removed', bot.BOT2_TOKEN not in scrubbed,
+              f"got {scrubbed!r}")
+        check('the message is still useful', 'rejected by the server' in scrubbed)
+
+        # A token this process does not hold — a typo'd env var — must go too.
+        other = bot._scrub_token('token 987654321:BBSomeOtherTokenValue00000 failed')
+        check('an unknown token is caught by shape',
+              '987654321' not in other, f"got {other!r}")
+    finally:
+        bot.BOT2_TOKEN = saved
+
+    # And the startup path must not use logger.exception, which prints the whole
+    # traceback including that message.
+    source = _source('bot.py')
+    start = source.index('async def _start_mirror')
+    end = source.index('async def _stop_mirror')
+    # The call form, not the bare name — the comment above it explains why the call
+    # is forbidden and would otherwise match itself.
+    check('the mirror startup does not log the raw exception',
+          'logger.exception(' not in source[start:end],
+          'logger.exception() in _start_mirror would leak the token')
+
+
+async def test_bot1_alerts_carry_no_buttons():
+    """The 👍/👎 row moved to bot 2, so bot 1 must not attach one."""
+    import notifier as notifier_mod
+
+    check('feedback_keyboard is gone from bot 1',
+          not hasattr(notifier_mod, 'feedback_keyboard'))
+
+    sent = {}
+
+    class _Bot:
+        async def send_message(self, **kwargs):
+            sent.update(kwargs)
+
+    n = notifier_mod.Notifier(_Bot())
+    ok = await n.send_deal_alert(1, {
+        'product_name': 'Samsung 55" TV', 'keyword': 'tv', 'price': 41999,
+        'channel_name': '@deals', 'channel_id': -1001234567890,
+        'deal_url': 'https://amzn.to/xyz', 'timestamp': time.time(),
+    })
+    check('the alert still sends', ok is True)
+    check('no reply_markup is attached', sent.get('reply_markup') is None,
+          f"got {sent.get('reply_markup')!r}")
+    check('bot 1 alerts still show a preview',
+          sent.get('disable_web_page_preview') is False)
+
+    # bot.py must still ANSWER the old buttons — alerts already in the chat keep
+    # their keyboard forever, and tapping one should not raise.
+    check('old fb_ callbacks are still handled',
+          "startswith('fb_u_')" in _source('bot.py'))
+
+
+async def test_mirror_button_callbacks_fit_and_round_trip():
+    from mirror import Mirror, mute_word_candidates
+
+    m = Mirror(bot=None, db=None, owner_id=1)
+
+    # A real channel id at the long end of the range, plus a real ASIN key.
+    markup = m.keyboard('amazon:B0CX23V2ZK', -1001234567890)
     buttons = markup.inline_keyboard[0]
-    check('both vote buttons are offered', len(buttons) == 2, f"got {len(buttons)}")
+    check('👍 and 👎 are both offered', len(buttons) == 2, f"got {len(buttons)}")
     check('callback data stays under 64 bytes',
           all(len(b.callback_data.encode()) <= 64 for b in buttons),
           f"got {[b.callback_data for b in buttons]}")
 
-    # Round-trip the parse bot.py does, including the negative id.
+    # Round-trip exactly the parse bot.py's mirror_button does.
     data = buttons[1].callback_data
-    _, verdict, raw_id = data.split('_', 2)
-    check('negative channel ids round-trip',
-          verdict == 'd' and int(raw_id) == -1001234567890, f"got {data!r}")
+    rest = data[len('mm_d_'):]
+    channel_raw, _, handle = rest.partition('_')
+    check('negative channel ids round-trip', int(channel_raw) == -1001234567890,
+          f"got {channel_raw!r}")
+    check('a short product key travels intact',
+          m.resolve_token(handle) == 'amazon:B0CX23V2ZK', f"got {handle!r}")
 
-    check('no channel id means no buttons', feedback_keyboard(None) is None)
+    # A long generic key cannot ride in callback_data, so it is parked under a token.
+    long_key = 'url:example.com/' + 'a' * 120
+    markup = m.keyboard(long_key, -100123)
+    handle = markup.inline_keyboard[0][1].callback_data[len('mm_d_'):].partition('_')[2]
+    check('a long key is tokenised', handle != long_key and len(handle) < 20)
+    check('the token resolves back', m.resolve_token(handle) == long_key)
+    check('an unknown token resolves to None',
+          m.resolve_token('t0123456789ab') is None)
+
+    # Word buttons.
+    words = mute_word_candidates('Samsung Galaxy M14 5G Smartphone at lowest price')
+    check('marketing filler is not offered', 'lowest' not in words and 'price' not in words,
+          f"got {words}")
+    check('the brand is offered', 'samsung' in words, f"got {words}")
+    wk = m.word_keyboard('Samsung Galaxy M14 5G Smartphone')
+    all_buttons = [b for row in wk.inline_keyboard for b in row]
+    check('every word button fits',
+          all(len(b.callback_data.encode()) <= 64 for b in all_buttons))
+    check('a skip option is always present',
+          any(b.callback_data == 'mm_done' for b in all_buttons))
+
+
+async def test_mirror_forces_the_product_preview():
+    """
+    The whole reason bot 2 exists: previews ON, and previewing the PRODUCT.
+
+    Without an explicit url Telegram previews the first link it finds, which can be
+    the source channel or a coupon page rather than the item.
+    """
+    from mirror import Mirror
+
+    m = Mirror(bot=None, db=None, owner_id=1)
+    kwargs = m._preview_kwargs('https://www.amazon.in/dp/B0CX23V2ZK')
+
+    check('preview is never disabled',
+          kwargs.get('disable_web_page_preview') is not True)
+    options = kwargs.get('link_preview_options')
+    if options is not None:
+        check('preview is explicitly enabled', options.is_disabled is False)
+        check('the product url is pinned',
+              options.url == 'https://www.amazon.in/dp/B0CX23V2ZK')
+    else:
+        check('fallback still enables the preview',
+              kwargs.get('disable_web_page_preview') is False)
+
+    # The product link must also lead the message body, so the fallback path (an
+    # older python-telegram-bot with no LinkPreviewOptions) still previews the item.
+    body = m.format_post('Great deal today', 'LOOT DEALS',
+                         'https://www.amazon.in/dp/B0CX23V2ZK', '₹41,999', 'Samsung TV')
+    check('the product link leads the message', body.startswith('🛒 <a href="https://www.amazon.in/dp/B0CX23V2ZK"'),
+          f"got {body[:80]!r}")
+    check('the price is shown', '₹41,999' in body)
+    check('the channel is credited', 'via LOOT DEALS' in body)
+
+
+async def test_mirror_text_cannot_break_telegram_html():
+    """Channel posts are full of <, > and & — every one must arrive escaped."""
+    from mirror import Mirror
+
+    m = Mirror(bot=None, db=None, owner_id=1)
+    nasty = 'Samsung 55" <b>TV</b> & more >> 40% off <script>'
+    body = m.format_post(nasty, 'A & B <deals>', 'https://x.com/p?a=1&b=2',
+                         None, 'Sony <TV> 4K')
+
+    check('raw angle brackets from the post are escaped',
+          '<b>TV</b>' not in body and '&lt;b&gt;TV&lt;/b&gt;' in body)
+    check('the channel name is escaped', '&lt;deals&gt;' in body)
+    check('the preview title is escaped', '&lt;TV&gt;' in body)
+    # The real bar: Telegram must accept the whole message. An unsupported or
+    # unbalanced tag is a 400, so the post would not arrive at all.
+    problems = _html_problems(body, 'mirror post')
+    check('Telegram would accept the message', not problems, '; '.join(problems))
+
+    # The ampersand in the URL has to be escaped inside the href attribute too.
+    check('the href is attribute-escaped', 'a=1&amp;b=2' in body,
+          f"got {body[:120]!r}")
 
 
 class _FakeMessage:
@@ -1313,7 +1895,19 @@ async def main():
         test_channel_counters_survive_deal_pruning,
         test_channel_report_renders,
         test_report_schedule_survives_restarts,
-        test_feedback_keyboard_fits_telegrams_limit,
+        # ── Bot 2 (mirror), and the duplicate/statistics fixes ──
+        test_product_key_survives_affiliate_rewriting,
+        test_the_same_deal_from_two_channels_alerts_once,
+        test_mirror_mutes_and_dedups,
+        test_both_bots_receive_one_message,
+        test_mirror_is_independent_of_the_watchlist,
+        test_stats_explain_themselves,
+        test_the_muted_screen_can_undo_everything_it_lists,
+        test_a_bad_bot2_token_never_reaches_the_logs,
+        test_bot1_alerts_carry_no_buttons,
+        test_mirror_button_callbacks_fit_and_round_trip,
+        test_mirror_forces_the_product_preview,
+        test_mirror_text_cannot_break_telegram_html,
         test_bare_commands_ask_instead_of_erroring,
         test_interface_wiring_has_no_dead_buttons,
         test_watchlist_view_offers_per_keyword_actions,
