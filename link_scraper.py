@@ -38,6 +38,10 @@ class LinkScraper:
 
     def __init__(self):
         self._cache = OrderedDict()  # url -> (title, timestamp)
+        # Short link -> where it lands. Separate from _cache because resolving a
+        # redirect is far cheaper than scraping a page, so the two have no reason to
+        # evict each other.
+        self._redirects = OrderedDict()  # url -> (final_url, timestamp)
         self._session = None
         self._session_lock = asyncio.Lock()
 
@@ -65,6 +69,7 @@ class LinkScraper:
             await self._session.close()
         self._session = None
         self._cache.clear()
+        self._redirects.clear()
 
     def _is_cached(self, url):
         """Check if URL result is cached and not expired."""
@@ -200,6 +205,57 @@ class LinkScraper:
             # cycles so the memory comes back at once instead of waiting for the GC's
             # generational sweep.
             soup.decompose()
+
+    async def resolve_final_url(self, url):
+        """
+        Follow a short link to whatever it actually points at.
+
+        This exists for deduplication, not scraping. A shortened link carries no
+        product id — 'amzn.to/3xYzAbC' and 'amzn.to/4pQrStU' can be the same item
+        posted by two channels with different affiliate tags, and there is no way to
+        tell without asking where they lead. One redirect chain later both resolve to
+        the same /dp/ASIN URL, which product_key can reduce to one identity.
+
+        A HEAD request is enough and costs nothing to serve; some sites reject it, so
+        fall back to GET and abandon the body as soon as the final URL is known.
+        Returns the original URL unchanged on any failure — callers treat that as
+        "could not canonicalise" rather than an error.
+        """
+        if not url:
+            return url
+
+        cached = self._redirects.get(url)
+        if cached:
+            final, ts = cached
+            if time.time() - ts < SCRAPE_CACHE_TTL:
+                self._redirects.move_to_end(url)
+                return final
+            self._redirects.pop(url, None)
+
+        final = url
+        try:
+            session = await self._get_session()
+            try:
+                async with session.head(url, allow_redirects=True) as response:
+                    final = str(response.url)
+            except Exception:
+                async with session.get(url, allow_redirects=True) as response:
+                    final = str(response.url)
+        except asyncio.TimeoutError:
+            logger.debug(f"Redirect resolve timed out for {url}")
+            return url
+        except Exception as e:
+            logger.debug(f"Redirect resolve failed for {url}: {e}")
+            return url
+
+        self._redirects[url] = (final, time.time())
+        self._redirects.move_to_end(url)
+        while len(self._redirects) > SCRAPE_CACHE_SIZE:
+            self._redirects.popitem(last=False)
+
+        if final != url:
+            logger.debug(f"Resolved {url} -> {final}")
+        return final
 
     async def scrape_url(self, url):
         """
