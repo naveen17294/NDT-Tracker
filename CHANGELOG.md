@@ -2,6 +2,44 @@
 
 Why each change exists is in `claude.md`; how to deploy is in `DEPLOYMENT.md`.
 
+## v1.6.0
+
+**Added a second bot — the channel mirror.** Set `BOT2_TOKEN` and everything the
+tracked channels post arrives in a second chat **with link previews on**, so you can
+see the product image, title and price without opening every link. A Telegram channel
+shows none of that, which made browsing them useless.
+
+The two bots are opposites, and that is the point:
+
+- **bot 1** sends only what matches your watchlist.
+- **bot 2** sends everything *except* what you muted.
+
+Bot 2 runs off the same Telethon connection and the same tracked channels, so there
+is nothing extra to configure. Leave `BOT2_TOKEN` empty and bot 1 behaves exactly as
+before. Press Start on bot 2 once — Telegram won't let a bot message you otherwise.
+
+**👎 on a mirrored post hides that product for good,** then offers words from its
+title so you can mute a brand or a whole category in one more tap. `/muted` lists
+everything hidden, with an undo for each.
+
+**Fixed: the same deal from two channels alerted twice.** Both tracked channels post
+the same item minutes apart, each with its own affiliate link and its own wording, so
+nothing about the link or the text was stable — and the dedup hash was built from the
+text. Deals are now identified by the seller's own product id (Amazon ASIN, Flipkart
+pid), which is identical across channels and across affiliate tags. Short links are
+followed to their destination first, since `amzn.to/xxx` carries no id at all.
+
+**Fixed: the status screen couldn't explain an empty result.** A zero and a failed
+query looked identical, and nothing said which database had been read. `/stats` now
+names the storage backend and location, reports a broken metric as `⚠️ error` instead
+of `0`, and when the counts really are zero it says why and what to do about it. It
+also warns when storage is a local file, which is wiped on every restart on a host
+with no disk — that alone reads as empty statistics *and* returning duplicates.
+
+**Removed 👍/👎 from bot 1's alerts.** The gesture moved to bot 2, where it does more:
+bot 1 only ever sends what you asked for by name, while the mirror shows everything.
+Buttons on alerts already in your chat keep working.
+
 ## v1.5.0
 
 **Commands now ask for what they need.** Tapping a command in Telegram's menu sends

@@ -7,20 +7,37 @@ Ops: `DEPLOYMENT.md`. Releases: `CHANGELOG.md`. Overview: `PROJECT_CONTEXT.md`.
 
 ## Architecture
 
-- **Dual client** — `telethon` (user API) silently monitors channels;
-  `python-telegram-bot` (bot API) handles commands and alerts.
+- **One Telethon client, two bots.** `telethon` (user API) silently monitors
+  channels and is the only thing reading them. Both bots are fed from it:
+  - **bot 1** (`BOT_TOKEN`) — a **filter**. Sends only what matches your watchlist.
+  - **bot 2** (`BOT2_TOKEN`) — a **feed**. Sends everything *except* what you muted.
 - **Storage** — `database.py` (API) over `storage.py` (SQLite or Postgres backend).
 - **Headless** — `SESSION_STRING` lets Telethon log in with no terminal.
 
-Pipeline: message → match keywords → resolve product name → extract price →
-deduplicate → alert.
+Pipeline: message → canonical product key → **mirror to bot 2** → match keywords →
+resolve product name → extract price → deduplicate → alert via bot 1.
+
+> ⚠️ **The mirror runs before the watchlist check, and is never awaited.** Bot 2's
+> whole purpose is the posts bot 1 rejects, so gating it on a keyword match — or on
+> a non-empty watchlist — silences it entirely. And it throttles itself to stay
+> inside Telegram's per-chat rate limit, so awaiting it inline would add up to a
+> second to every bot 1 alert. `_spawn_mirror()` detaches it and keeps a reference to
+> the task, because a task with no strong reference can be collected mid-flight and
+> take its exception with it. Pinned by
+> `test_mirror_is_independent_of_the_watchlist` and `test_both_bots_receive_one_message`.
+
+`run_polling()` can only be called once, so bot 1 owns the event loop and bot 2's
+`Application` is driven by hand (`initialize` / `start` / `updater.start_polling`)
+inside bot 1's `post_init`. Bot 2 must poll even though its commands come later: a
+callback query goes to the bot that **sent** the message, so without polling every
+👎 would silently do nothing.
 
 ## Commands
 
 `/menu` — the button hub. `/watch` `/unwatch` `/updatesynonyms` `/exclude`
 `/watchlist` — keywords. `/channels` `/searchchannel` `/addchannel`
-`/untrackchannel` `/channelreport` — sources. `/deals` `/stats` `/pause` `/resume`
-`/keyboard` `/cancel` — control.
+`/untrackchannel` `/channelreport` — sources. `/muted` — bot 2's filter.
+`/deals` `/stats` `/pause` `/resume` `/keyboard` `/cancel` — control.
 
 `/testmatch <text>` `/synonyms <keyword>` — **debug matching**; reach for these
 first, since a wrong match is indistinguishable from a right one from outside.
@@ -134,12 +151,85 @@ Toggling and paging re-render whatever view the button was pressed in.
 ## 4. Price, dedup, alerts
 
 Prices use `[\d,]+` so `₹1,000` isn't truncated, and catch a bare number beside a
-link (`2950 : https://...`). Dedup hashes **cleaned product name + price + keyword**,
-not raw text, so the same deal reposted with a new affiliate link is dropped.
-Alerts are HTML (not MarkdownV2) with `html.escape()`, so odd characters can't
-break delivery.
+link (`2950 : https://...`). Alerts are HTML (not MarkdownV2) with `html.escape()`,
+so odd characters can't break delivery.
 
-## 5. Feedback & the channel report
+**Dedup is keyed on product identity** (`product_key.py`), which is the fix for the
+duplicate you actually notice.
+
+> ⚠️ **Neither the URL nor the message text can identify a deal.** Every channel
+> rewrites the same link with its own affiliate tag and wraps it in its own
+> marketing blast, so one product posted by two channels gives two different links
+> and two different texts. The old hash was built from the cleaned product name, so
+> it differed every time and both copies alerted. `canonical_key()` reduces a link
+> to the seller's own id instead — `amazon:B0CX23V2ZK` from any of `/dp/`,
+> `/gp/product/`, `?asin=`, with tracking stripped; Flipkart's `pid` beats its path
+> slug. Price is deliberately **out** of the hash: the two posts often quote it
+> differently and it is the same deal at ₹2,899 or ₹2,999.
+
+An ASIN is **exactly ten characters**. Loosening that regex makes unrelated pages
+dedup against each other, and the second deal is then silently swallowed —
+`test_product_key_survives_affiliate_rewriting` pins both ends of the boundary.
+
+Short links (`amzn.to`, `fkrt.it`) carry no id at all, so
+`LinkScraper.resolve_final_url()` follows the redirect first (HEAD, falling back to
+GET; cached per short link). Without that step, cross-channel dedup cannot work on
+the shortened links deal channels actually post. `RESOLVE_SHORT_LINKS=false` opts
+out. Where no key can be derived, the old name+price+keyword hash still applies.
+
+## 5. Bot 2 — the mirror (`mirror.py`)
+
+A Telegram channel is a bad shopping surface: walls of emoji, a bare shortened link,
+no preview card, no way to tell a ₹400 case from a ₹40,000 phone without opening
+every one. Bot 2 re-sends each post into a private chat **with the link preview
+forced on and pinned to the product URL**, so the image, title and price render
+inline. That is the entire reason bot 2 exists, which is why the preview is not
+configurable.
+
+> ⚠️ **`LinkPreviewOptions(url=...)` is doing real work — don't drop it for plain
+> `disable_web_page_preview=False`.** With no explicit url Telegram previews the
+> *first* link in the message, which can be the source channel or a coupon page
+> rather than the item. The product link also leads the message body so the fallback
+> path (an older python-telegram-bot with no `LinkPreviewOptions`) still previews the
+> right thing.
+
+Three filters keep the feed from becoming noise:
+
+- **Mutes.** 👎 mutes that product by canonical key — so it stays muted when the
+  channel reposts it under a fresh tag — then offers words from its title to mute a
+  brand or category in one more tap. Words match on whole words only, so muting
+  `saree` cannot silence `sareena`.
+- **Cross-channel dedup.** `mirror_seen` is the same shape and lifetime as
+  `matched_deals`: a key and a timestamp, pruned on the same timer. It is in the
+  database rather than memory so a restart cannot resurrect a duplicate.
+- **Rate limiting.** Telegram refuses past roughly one message per second to a
+  single chat, and a deal channel bursts well past that. Sends are serialised and
+  spaced, and a 429 is obeyed once rather than dropping the post.
+
+Mutes are **decisions, not history** — never pruned on a timer, unlike the dedup
+ledger beside them. `/muted` lists them with an undo, because a mute is permanent
+and taken on a single tap: without a visible reversible list, a mis-tapped 👎 hides
+a product for good with no way to discover it happened.
+
+`callback_data` is capped at 64 bytes. A real product id fits (`amazon:B0CX23V2ZK`
+is 18), so those buttons keep working after a restart; only long generic URL keys
+need the in-memory token map, and a token lost to a restart degrades to "mute a word
+instead" rather than erroring.
+
+> ⚠️ **Never log a bot-token failure verbatim.** python-telegram-bot puts the
+> rejected token *inside* its own error message ("The token `123:abc` was
+> rejected"), so `logger.exception` on the mirror's startup path writes `BOT2_TOKEN`
+> into the host's logs in plain text on every failed boot. `_scrub_token()` filters
+> anything on its way to a log.
+
+Bot 2 failing to start can never take bot 1 down: `_start_mirror()` contains every
+error, leaves `monitor.mirror` as None, and `/stats` distinguishes "⚪ Off (reason)"
+from "🔴 Failed to start". No `BOT2_TOKEN` is the supported single-bot mode.
+
+**You must press Start on bot 2 once.** Telegram forbids a bot messaging a user who
+has never opened a chat with it.
+
+## 6. Feedback & the channel report
 
 > ⚠️ **NDT keeps no history of alerts. Do not add one.** `matched_deals` is a dedup
 > ledger pruned after `DEAL_RETENTION_DAYS`, so nothing per-alert survives a week —
@@ -150,11 +240,18 @@ through: `alerts`, `up`, `down`, plus `*_at_report` snapshots. The 8-hourly repo
 subtracts the snapshot to get "since last time" and then re-snapshots, which is how
 it shows a delta without storing anything per alert.
 
-Every alert carries 👍/👎 with the **channel id in the button's `callback_data`**.
-That is the mechanism, not a shortcut: the vote is attributable when pressed, so no
-record of the alert has to exist. On a vote the keyboard is replaced with a static
-receipt — the message's own markup is the only thing preventing a double vote, again
-because there is no row to check against.
+**The 👍/👎 gesture lives on bot 2, not bot 1.** Bot 1 only ever sends what you
+already asked for by name, so rating it says little; the mirror shows everything, and
+a 👎 there both mutes the product and counts against the channel. Bot 1's alerts now
+carry no buttons at all — but `bot.py` still **handles** the old `fb_*` callbacks,
+because alerts already sitting in the chat keep their keyboard forever and tapping
+one must not error.
+
+Votes carry the **channel id in the button's `callback_data`**. That is the
+mechanism, not a shortcut: the vote is attributable when pressed, so no record of the
+alert has to exist. On a vote the keyboard is replaced with a static receipt — the
+message's own markup is the only thing preventing a double vote, again because there
+is no row to check against.
 
 `record_alert()` is called only when the notifier reports the alert actually went
 out. Counting before that inflates a channel's total with in-window duplicates you
@@ -170,7 +267,7 @@ silently eating it.
 > The same property makes a failed send retry (the timestamp did not move) instead of
 > skipping the window.
 
-## 6. Persistence
+## 7. Persistence
 
 `storage.py` picks a backend from `DATABASE_URL`: Postgres when set, SQLite
 otherwise. `database.py`'s API is identical either way. Postgres exists because a
@@ -186,6 +283,10 @@ Rules when touching SQL — it is written once in `?` style and translated to `$
 - `channels.channel_id` is **BIGINT** on Postgres, not optional: Telegram IDs
   exceed 32 bits and Postgres `INTEGER` really is 32-bit, unlike SQLite's.
 - `PRAGMA` is SQLite-only — it lives behind `backend.maintenance()`.
+- A brand-new **table** is fine to add to `schema()` alone — `CREATE TABLE IF NOT
+  EXISTS` does create it on a database that already exists. That is how
+  `muted_products`, `muted_terms` and `mirror_seen` reach a deployed database with no
+  migration step. A new **column** is the case that silently does nothing:
 - **A new column on an existing table needs a migration, not just a schema edit.**
   `CREATE TABLE IF NOT EXISTS` does nothing for a table that already exists, so a
   deployed database never gets the column. Add it to `_COLUMN_MIGRATIONS` in
@@ -204,7 +305,7 @@ Rules when touching SQL — it is written once in `?` style and translated to `$
 Tools: `check_db.py` (verify a database before deploying), `migrate_to_postgres.py`
 (copy an existing SQLite file across; idempotent, deletes nothing).
 
-## 7. Memory management
+## 8. Memory management
 
 Long-lived process on a small container — anything per-message compounds.
 
@@ -221,7 +322,7 @@ Long-lived process on a small container — anything per-message compounds.
 - One shared `aiohttp.ClientSession` (was a new TLS context per URL), page reads
   capped via streaming, `soup.decompose()` to break BeautifulSoup's cycles.
 
-## 8. Startup
+## 9. Startup
 
 > ⚠️ **`main()`'s `asyncio.set_event_loop()` block looks like dead code and is not.**
 > python-telegram-bot 21.x calls `asyncio.get_event_loop()` inside `run_polling()`.
@@ -236,8 +337,16 @@ Long-lived process on a small container — anything per-message compounds.
 
 ## Tests
 
-`python test_pipeline.py` — offline, no credentials or network. 231 assertions
+`python test_pipeline.py` — offline, no credentials or network. 319 assertions
 covering the `WebPagePending` retry, both preview API shapes, the lookalike-word
 false positives, category leakage, negative-keyword vetoes, channel counters
 surviving a deal prune, cache bounds, Postgres retry/translation, and the
 event-loop shim.
+
+For the two bots specifically: affiliate-link collapsing and the ten-character ASIN
+boundary, the same deal from two channels alerting once, mute/dedup/prune
+interaction, the forced product preview, callback data staying inside 64 bytes with
+a long key round-tripping through the token map, bot-token scrubbing, and
+`test_both_bots_receive_one_message`, which drives a real message through
+`_handle_message` and asserts bot 1 filters while bot 2 mirrors — including that an
+**empty watchlist does not silence bot 2**.
