@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,17 @@ class SqliteBackend:
         self.db_path = db_path
         self._conn = None
         self._lock = asyncio.Lock()
+
+    @property
+    def location(self):
+        """
+        Where the data actually is, for /stats to show.
+
+        Worth surfacing because the single most confusing failure this bot has is a
+        SQLite file on a host with an ephemeral disk: everything works, then a restart
+        silently empties the watchlist and every count reads zero.
+        """
+        return self.db_path
 
     async def _ensure_conn(self):
         if self._conn is None:
@@ -189,8 +201,32 @@ class SqliteBackend:
                    last_alert_at REAL DEFAULT 0,
                    last_report_at REAL DEFAULT 0
                )''',
+            # ── Bot 2 (mirror) ──
+            # Products you muted with 👎, by canonical product key (see
+            # product_key.py) so a mute survives the item being reposted under a
+            # fresh affiliate tag. One row per muted item, kept until you unmute it.
+            '''CREATE TABLE IF NOT EXISTS muted_products (
+                   product_key TEXT PRIMARY KEY,
+                   label TEXT DEFAULT '',
+                   muted_at REAL NOT NULL
+               )''',
+            # Words muted from the mirror feed. Broader than a product mute: one row
+            # silences a brand or a category for good.
+            '''CREATE TABLE IF NOT EXISTS muted_terms (
+                   term TEXT PRIMARY KEY,
+                   muted_at REAL NOT NULL
+               )''',
+            # The mirror's dedup ledger — the same shape and lifetime as
+            # matched_deals, and pruned on the same schedule. Not a history of what
+            # was sent: it holds a key and a timestamp, nothing about the post, and
+            # rows age out after DEAL_RETENTION_DAYS.
+            '''CREATE TABLE IF NOT EXISTS mirror_seen (
+                   dedup_key TEXT PRIMARY KEY,
+                   seen_at REAL NOT NULL
+               )''',
             'CREATE INDEX IF NOT EXISTS idx_deals_matched_date ON matched_deals(matched_date)',
             'CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(active)',
+            'CREATE INDEX IF NOT EXISTS idx_mirror_seen_at ON mirror_seen(seen_at)',
         ]
 
 
@@ -238,6 +274,17 @@ class PostgresBackend:
         self._pool = None
         self._lock = asyncio.Lock()
         self._retryable = None
+
+    @property
+    def location(self):
+        """Host and database name, password removed — safe to show in a chat."""
+        try:
+            parsed = urlparse(self.dsn)
+            host = parsed.hostname or '?'
+            dbname = (parsed.path or '').lstrip('/') or '?'
+            return f'{host}/{dbname}'
+        except Exception:
+            return redact_dsn(self.dsn)
 
     def _retryable_errors(self):
         """
@@ -444,8 +491,23 @@ class PostgresBackend:
                    last_alert_at DOUBLE PRECISION DEFAULT 0,
                    last_report_at DOUBLE PRECISION DEFAULT 0
                )''',
+            # ── Bot 2 (mirror) — see the SQLite copy for what each one is for ──
+            '''CREATE TABLE IF NOT EXISTS muted_products (
+                   product_key TEXT PRIMARY KEY,
+                   label TEXT DEFAULT '',
+                   muted_at DOUBLE PRECISION NOT NULL
+               )''',
+            '''CREATE TABLE IF NOT EXISTS muted_terms (
+                   term TEXT PRIMARY KEY,
+                   muted_at DOUBLE PRECISION NOT NULL
+               )''',
+            '''CREATE TABLE IF NOT EXISTS mirror_seen (
+                   dedup_key TEXT PRIMARY KEY,
+                   seen_at DOUBLE PRECISION NOT NULL
+               )''',
             'CREATE INDEX IF NOT EXISTS idx_deals_matched_date ON matched_deals(matched_date)',
             'CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(active)',
+            'CREATE INDEX IF NOT EXISTS idx_mirror_seen_at ON mirror_seen(seen_at)',
         ]
 
 

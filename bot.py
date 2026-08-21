@@ -27,6 +27,7 @@ from database import Database
 from keyword_matcher import KeywordMatcher, parse_exclusions
 from channel_monitor import ChannelMonitor
 from config import (
+    BOT2_TOKEN,
     BOT_TOKEN,
     CHANNEL_NAME_FILTERS,
     CHANNEL_QUIET_DAYS,
@@ -37,10 +38,12 @@ from config import (
     KEEPALIVE_INTERVAL,
     KEEPALIVE_URL,
     MAINTENANCE_INTERVAL_HOURS,
+    MIRROR_ENABLED,
     OWNER_ID,
     PORT,
     WATCHDOG_INTERVAL,
 )
+from mirror import Mirror
 from utils import channel_display_name, channel_matches, format_time_ago
 
 # Where the active /searchchannel query is parked, so pagination and toggling stay
@@ -63,6 +66,11 @@ logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 db = Database()
 matcher = KeywordMatcher()
 monitor = None  # Global reference to ChannelMonitor
+
+# Bot 2 — the mirror. Both are None until post_init, and stay None when BOT2_TOKEN is
+# unset, which is the supported way to run bot 1 on its own.
+mirror = None            # mirror.Mirror
+_mirror_app = None       # its own telegram.ext.Application, polled alongside bot 1's
 
 # Background tasks + web server handles, kept so shutdown can cancel/close them
 # instead of leaking a task and its captured frames on every restart.
@@ -271,12 +279,20 @@ rest are noise.
 /searchchannel <code>&lt;text&gt;</code> — reaches every joined channel.
 /addchannel <code>&lt;@name or link&gt;</code> — join and track a new one.
 
-<b>3️⃣ Rate your alerts</b>
-Every alert carries 👍/👎. One tap says whether that channel is worth keeping —
-it feeds /channelreport, which also arrives on its own every 8 hours. Nothing
-about the alert itself is stored, only per-channel tallies.
+<b>3️⃣ Two bots</b>
+<b>This bot</b> sends only what matches your targets above.
+<b>The mirror bot</b> sends everything those same channels post — <i>except</i> what
+you mute — with previews on, so you can see products without opening every link.
 
-<b>4️⃣ Control</b>
+<b>4️⃣ Muting (the mirror)</b>
+👎 on a mirrored post hides that product for good, then offers words from its
+title so you can silence a brand or a whole category in one more tap.
+👍 says the channel is worth keeping — it feeds /channelreport, which also
+arrives on its own every 8 hours. Nothing about the post itself is stored, only
+per-channel tallies.
+/muted — everything the mirror is hiding, with an undo for each.
+
+<b>5️⃣ Control</b>
 /pause · /resume · /stats · /keyboard <code>on|off</code>
 
 <i>System ready.</i> ⚡"""
@@ -1128,7 +1144,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ('menu_watchlist', 'menu_deals', 'menu_stats', 'menu_channels',
-                'menu_report', 'menu_help'):
+                'menu_report', 'menu_muted', 'menu_help'):
         back = InlineKeyboardMarkup(
             [[InlineKeyboardButton('« Menu', callback_data='menu_home')]])
         try:
@@ -1143,6 +1159,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 view = await _get_channels_page(0)
             elif data == 'menu_report':
                 view = (build_channel_report(await db.get_channel_report()), back)
+            elif data == 'menu_muted':
+                view = await _render_muted()
             else:
                 view = (HELP_TEXT, back)
             # Deliberately no per-branch parse mode: every renderer above is HTML,
@@ -1222,9 +1240,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"Could not update feedback buttons: {e}")
         await query.answer('Noted — it shapes /channelreport.')
 
-    # The receipt button left behind after a vote.
+    # The receipt button left behind after a vote or a mute.
     elif data == 'fb_done':
-        await query.answer('Already rated.')
+        await query.answer('Already done.')
+
+    # ── Unmute, from /muted ──
+    elif data.startswith('mu_t_'):
+        term = data[5:]
+        try:
+            await db.unmute_term(term)
+        except Exception as e:
+            logger.error(f"Could not unmute '{term}': {e}")
+            await query.answer("❌ Couldn't unmute that.")
+            return
+        if mirror:
+            mirror.invalidate_mutes()
+        await query.answer(f'"{term}" is back.')
+        await _edit_view(query, await _render_muted())
+
+    elif data.startswith('mu_p_'):
+        key = data[5:]
+        try:
+            await db.unmute_product(key)
+        except Exception as e:
+            logger.error(f"Could not unmute a product: {e}")
+            await query.answer("❌ Couldn't unmute that.")
+            return
+        await query.answer('That product is back.')
+        await _edit_view(query, await _render_muted())
+
+    elif data == 'mu_clear':
+        try:
+            removed = await db.clear_mutes()
+        except Exception as e:
+            logger.error(f"Could not clear mutes: {e}")
+            await query.answer("❌ Couldn't clear the mutes.")
+            return
+        if mirror:
+            mirror.invalidate_mutes()
+        await query.answer(
+            f"Cleared {removed['products']} product(s) and {removed['terms']} word(s).")
+        await _edit_view(query, await _render_muted())
 
     # Toggle channel callback
     elif data.startswith('toggle_ch_'):
@@ -1379,6 +1435,73 @@ async def channel_report_command(update: Update, context: ContextTypes.DEFAULT_T
         disable_web_page_preview=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Muted list (bot 2's filter, managed from bot 1)
+# ══════════════════════════════════════════════════════════════════════
+
+
+@owner_only
+async def muted_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """What bot 2 is hiding, and how to undo it."""
+    await _reply_view(update, await _render_muted())
+
+
+async def _render_muted():
+    """
+    Everything muted from the mirror, each with an undo.
+
+    A mute is permanent and taken on a single tap, so it needs a visible, reversible
+    list. Without one a mis-tapped 👎 silently hides a product for good and there is
+    no way to discover that it happened.
+    """
+    try:
+        products = await db.get_muted_products(limit=20)
+        terms = await db.get_muted_terms()
+    except Exception as e:
+        logger.error(f"Could not read the mute list: {e}")
+        return ("🔇 <b>MUTED</b>\n\n⚠️ Couldn't read the mute list.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton('« Menu', callback_data='menu_home')]]))
+
+    lines = ['🔇 <b>MUTED FROM THE MIRROR</b>',
+             '\nBot 2 sends everything except these. Bot 1 is unaffected.\n']
+    rows = []
+
+    if terms:
+        lines.append(f'<b>Words</b> ({len(terms)})')
+        lines.append(', '.join(f'<code>{html.escape(t)}</code>' for t in terms[:40]))
+        lines.append('')
+        buttons = [
+            InlineKeyboardButton(f'🔊 {t}', callback_data=f'mu_t_{t}')
+            for t in terms[:8] if len(f'mu_t_{t}'.encode('utf-8')) <= 64
+        ]
+        rows.extend([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+    if products:
+        lines.append(f'<b>Products</b> ({len(products)})')
+        for index, row in enumerate(products[:10], start=1):
+            label = row['label'] or row['product_key']
+            lines.append(f"{index}. {html.escape(str(label)[:70])}")
+        lines.append('')
+        # Numbered to match the list above — a product's label is far too long for a
+        # button, and the canonical key is unreadable.
+        buttons = []
+        for index, row in enumerate(products[:10], start=1):
+            data = f"mu_p_{row['product_key']}"
+            if len(data.encode('utf-8')) <= 64:
+                buttons.append(InlineKeyboardButton(f'🔊 {index}', callback_data=data))
+        rows.extend([buttons[i:i + 5] for i in range(0, len(buttons), 5)])
+
+    if not terms and not products:
+        lines.append('<i>Nothing muted. The mirror is showing everything.</i>')
+
+    if terms or products:
+        rows.append([InlineKeyboardButton('🗑️ Clear all mutes', callback_data='mu_clear')])
+    rows.append([InlineKeyboardButton('« Menu', callback_data='menu_home')])
+
+    return '\n'.join(lines), InlineKeyboardMarkup(rows)
+
+
 async def _start_web_server():
     """
     Bind the HTTP port Render expects.
@@ -1464,10 +1587,14 @@ async def _watchdog_loop():
 
 async def _maintenance_loop():
     """
-    Prune old deals on a timer.
+    Prune both dedup ledgers on a timer.
 
     cleanup_old_deals() has always existed but nothing ever called it, so
-    matched_deals grew for the entire life of the deployment.
+    matched_deals grew for the entire life of the deployment. mirror_seen is the
+    same shape and gets the same treatment — it holds keys and timestamps only, and
+    nothing in it needs to outlive the dedup window.
+
+    Muted products and terms are NOT pruned here. A mute is a decision, not history.
     """
     interval = MAINTENANCE_INTERVAL_HOURS * 3600
     while True:
@@ -1480,6 +1607,15 @@ async def _maintenance_loop():
             raise
         except Exception as e:
             logger.error(f"Maintenance error: {e}")
+
+        try:
+            deleted = await db.cleanup_mirror_seen(DEAL_RETENTION_DAYS)
+            if deleted:
+                logger.info(f"🧹 Maintenance: pruned {deleted} mirror dedup keys")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Mirror maintenance error: {e}")
 
 
 async def _seconds_until_next_report(interval):
@@ -1520,6 +1656,218 @@ async def _channel_report_loop():
             logger.error(f"Channel report failed: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Bot 2 — the mirror
+# ══════════════════════════════════════════════════════════════════════
+#
+# A second Telegram bot in the same process, on the same Telethon connection and the
+# same tracked channels. See mirror.py for what it sends and why.
+#
+# Two bots, one process, one event loop. Bot 1 keeps run_polling(), which owns the
+# loop; bot 2's Application is driven by hand inside bot 1's post_init, because
+# run_polling() can only be called once. Bot 2 has to poll at all — even though its
+# commands come later — because a callback query from an inline button is delivered
+# to the bot that sent the message, so without polling every 👎 would do nothing.
+
+
+@owner_only
+async def mirror_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start on bot 2 — mostly there so the chat can be opened."""
+    await update.effective_message.reply_text(
+        "🪞 <b>NDT MIRROR</b>\n\n"
+        "Everything the tracked channels post lands here, with previews on — "
+        "except what you mute.\n\n"
+        "👎 <b>Not interested</b> hides that product for good, then offers a word "
+        "to mute the whole category.\n\n"
+        "Manage what's muted with /muted in the main bot.",
+        parse_mode='HTML')
+
+
+@owner_only
+async def mirror_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons on a mirrored post. Runs on bot 2's Application, not bot 1's."""
+    query = update.callback_query
+    data = query.data or ''
+
+    # 👍 — nothing to mute, just credit the channel.
+    if data.startswith('mm_u_'):
+        try:
+            await db.record_feedback(int(data[5:]), True)
+        except Exception as e:
+            logger.error(f"Could not record mirror feedback: {e}")
+            await query.answer("❌ Couldn't save that.")
+            return
+        await _swap_keyboard(query, '👍 Rated good')
+        await query.answer('Noted — it shapes /channelreport.')
+        return
+
+    # 👎 — mute this product, count it against the channel, then offer words.
+    if data.startswith('mm_d_'):
+        rest = data[5:]
+        channel_raw, _, handle = rest.partition('_')
+        product_key = mirror.resolve_token(handle) if mirror else None
+
+        if product_key:
+            try:
+                await db.mute_product(product_key, _mirror_label(query.message))
+            except Exception as e:
+                logger.error(f"Could not mute product: {e}")
+                await query.answer("❌ Couldn't save that.")
+                return
+        # 0 is the mirror's "channel unknown" placeholder — never record against it.
+        try:
+            channel_id = int(channel_raw)
+            if channel_id:
+                await db.record_feedback(channel_id, False)
+        except Exception as e:
+            logger.debug(f"Could not record mirror feedback: {e}")
+
+        # The product is already muted; the words are an optional second tap.
+        words = query.message.text or ''
+        try:
+            await query.edit_message_reply_markup(mirror.word_keyboard(words))
+        except Exception as e:
+            logger.debug(f"Could not offer mute words: {e}")
+        await query.answer(
+            'Hidden. Mute a word too?' if product_key
+            else "Couldn't identify the product — mute a word instead.")
+        return
+
+    # A word from the product's title.
+    if data.startswith('mw_'):
+        term = data[3:].strip().lower()
+        if not term:
+            await query.answer('Nothing to mute.')
+            return
+        try:
+            added = await db.mute_term(term)
+        except Exception as e:
+            logger.error(f"Could not mute term: {e}")
+            await query.answer("❌ Couldn't save that.")
+            return
+        if mirror:
+            mirror.invalidate_mutes()
+        await _swap_keyboard(query, f'🔇 Muted "{term}"')
+        await query.answer(f'Muted "{term}".' if added else f'"{term}" was already muted.')
+        return
+
+    if data == 'mm_done':
+        await _swap_keyboard(query, '👎 Hidden')
+        await query.answer('Just this product, then.')
+        return
+
+    await query.answer()
+
+
+def _mirror_label(message):
+    """A short human label for a muted product, so /muted is readable."""
+    text = (message.text or '').strip() if message else ''
+    first = text.split('\n', 1)[0] if text else ''
+    return first[:120]
+
+
+async def _swap_keyboard(query, label):
+    """
+    Replace a post's buttons with a static receipt.
+
+    The message's own keyboard is the only record that it was acted on — no per-post
+    row exists to check against — so this is also what prevents double-voting.
+    """
+    try:
+        await query.edit_message_reply_markup(
+            InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data='fb_done')]]))
+    except Exception as e:
+        # Telegram refuses edits to messages older than 48h. Cosmetic only.
+        logger.debug(f"Could not update mirror buttons: {e}")
+
+
+def _scrub_token(value):
+    """
+    A message with any bot token removed.
+
+    Telegram tokens look like '123456789:AA...' and appear inside library error
+    strings, so anything on its way to a log gets filtered through here.
+    """
+    text = str(value)
+    for token in (BOT2_TOKEN, BOT_TOKEN):
+        if token:
+            text = text.replace(token, '***')
+    # Belt and braces for a token this process does not hold (a typo'd env var).
+    return re.sub(r'\b\d{6,12}:[A-Za-z0-9_-]{20,}\b', '***', text)
+
+
+def _mirror_off_reason():
+    """Why the mirror is not running, or None when it should be."""
+    if not BOT2_TOKEN:
+        return 'BOT2_TOKEN not set'
+    if not MIRROR_ENABLED:
+        return 'MIRROR_ENABLED=false'
+    return None
+
+
+async def _start_mirror():
+    """
+    Bring bot 2 up, and hand it to the monitor.
+
+    Every failure here is contained: if bot 2 cannot start, `monitor.mirror` stays
+    None and bot 1 carries on exactly as before.
+    """
+    global mirror, _mirror_app
+
+    reason = _mirror_off_reason()
+    if reason:
+        logger.info(f"Mirror disabled ({reason}) — bot 1 only.")
+        return
+
+    try:
+        _mirror_app = ApplicationBuilder().token(BOT2_TOKEN).build()
+        _mirror_app.add_handler(CommandHandler('start', mirror_start_command))
+        _mirror_app.add_handler(CallbackQueryHandler(mirror_button))
+
+        await _mirror_app.initialize()
+        await _mirror_app.start()
+        await _mirror_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        await _mirror_app.bot.set_my_commands([
+            BotCommand('start', '🪞 What this bot does'),
+        ])
+
+        mirror = Mirror(
+            _mirror_app.bot, db, OWNER_ID,
+            scraper=monitor.scraper if monitor else None)
+        if monitor:
+            monitor.mirror = mirror
+
+        me = await _mirror_app.bot.get_me()
+        logger.info(f"🪞 Mirror bot started as @{me.username}")
+    except Exception as e:
+        # Never log the exception verbatim. python-telegram-bot puts the rejected
+        # token INTO its own error message ("The token `123:abc` was rejected"), so a
+        # logger.exception here would write BOT2_TOKEN into the host's logs in plain
+        # text on every failed boot.
+        logger.error(f"Failed to start the mirror bot: {_scrub_token(e)}")
+        mirror = None
+        if monitor:
+            monitor.mirror = None
+        await _stop_mirror()
+
+
+async def _stop_mirror():
+    """Stop bot 2's polling and release it."""
+    global _mirror_app
+    if _mirror_app is None:
+        return
+    app, _mirror_app = _mirror_app, None
+    try:
+        if app.updater and app.updater.running:
+            await app.updater.stop()
+        if app.running:
+            await app.stop()
+        await app.shutdown()
+    except Exception as e:
+        logger.debug(f"Error stopping the mirror bot: {e}")
+
+
 async def post_init(application):
     """Start the Telethon monitor when the bot starts."""
     global monitor, _application
@@ -1541,6 +1889,7 @@ async def post_init(application):
         BotCommand("channels", "📢 Pick channels to monitor"),
         BotCommand("deals", "🔥 Deals matched in the last 24h"),
         BotCommand("channelreport", "📊 Which channels are worth keeping"),
+        BotCommand("muted", "🔇 What the mirror is hiding"),
         BotCommand("testmatch", "🧪 Would this message alert? (I'll ask)"),
         BotCommand("exclude", "🚫 Block terms for a keyword"),
         BotCommand("synonyms", "💡 What a keyword actually matches"),
@@ -1565,7 +1914,12 @@ async def post_init(application):
         # and /health + /stats now report the uplink as down so it's visible.
         logger.exception(f"Failed to start ChannelMonitor: {e}")
 
-    # ── 3. Background loops ──
+    # ── 3. Bot 2 ──
+    # After the monitor, because the mirror borrows its LinkScraper and has to be
+    # attached to it. Never before: a mirror with nothing feeding it is dead weight.
+    await _start_mirror()
+
+    # ── 4. Background loops ──
     _background_tasks.append(asyncio.create_task(_watchdog_loop(), name='watchdog'))
     _background_tasks.append(asyncio.create_task(_maintenance_loop(), name='maintenance'))
     _background_tasks.append(asyncio.create_task(_keepalive_loop(), name='keepalive'))
@@ -1593,6 +1947,9 @@ async def post_shutdown(application):
             await monitor.stop()
         except Exception as e:
             logger.debug(f"Error stopping monitor: {e}")
+
+    # After the monitor, so nothing is still trying to mirror into a stopped bot.
+    await _stop_mirror()
 
     if _web_runner is not None:
         try:
@@ -1654,6 +2011,7 @@ def main():
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("muted", muted_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("keyboard", keyboard_command))
     application.add_handler(CommandHandler("cancel", cancel_command))

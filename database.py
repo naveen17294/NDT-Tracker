@@ -1,7 +1,13 @@
 import logging
 import time
 
-from config import DATABASE_URL, DB_PATH, DEAL_RETENTION_DAYS, DEDUP_HOURS
+from config import (
+    DATABASE_URL,
+    DB_PATH,
+    DEAL_RETENTION_DAYS,
+    DEDUP_HOURS,
+    MIRROR_DEDUP_HOURS,
+)
 from storage import build_backend
 
 logger = logging.getLogger(__name__)
@@ -349,28 +355,167 @@ class Database:
             (now,)
         )
 
+    # ── Bot 2: muted products and terms ──
+    #
+    # Bot 1 filters IN (only watchlist matches are sent). Bot 2 filters OUT
+    # (everything is sent except what you muted), so this is its entire config.
+    # Both are small, permanent lists — a mute is a decision, not history, and it
+    # is never pruned on a timer.
+
+    async def mute_product(self, product_key, label=''):
+        """Mute one product by canonical key. False if it was already muted."""
+        if not product_key:
+            return False
+        affected = await self.backend.execute(
+            '''INSERT INTO muted_products (product_key, label, muted_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT (product_key) DO NOTHING''',
+            (product_key, (label or '')[:120], time.time())
+        )
+        return affected > 0
+
+    async def unmute_product(self, product_key):
+        affected = await self.backend.execute(
+            'DELETE FROM muted_products WHERE product_key = ?', (product_key,))
+        return affected > 0
+
+    async def muted_product_keys(self, keys):
+        """Which of `keys` are muted. Empty list in, empty set out — no query run."""
+        keys = [k for k in (keys or []) if k]
+        if not keys:
+            return set()
+        placeholders = ','.join('?' for _ in keys)
+        rows = await self.backend.fetch_all(
+            f'SELECT product_key FROM muted_products WHERE product_key IN ({placeholders})',
+            tuple(keys)
+        )
+        return {row['product_key'] for row in rows}
+
+    async def get_muted_products(self, limit=50):
+        return await self.backend.fetch_all(
+            'SELECT product_key, label, muted_at FROM muted_products '
+            'ORDER BY muted_at DESC LIMIT ?',
+            (limit,)
+        )
+
+    async def mute_term(self, term):
+        """Mute a word or phrase from the mirror feed. False if already muted."""
+        term = (term or '').strip().lower()
+        if not term:
+            return False
+        affected = await self.backend.execute(
+            '''INSERT INTO muted_terms (term, muted_at) VALUES (?, ?)
+               ON CONFLICT (term) DO NOTHING''',
+            (term, time.time())
+        )
+        return affected > 0
+
+    async def unmute_term(self, term):
+        affected = await self.backend.execute(
+            'DELETE FROM muted_terms WHERE term = ?', ((term or '').strip().lower(),))
+        return affected > 0
+
+    async def get_muted_terms(self):
+        """Every muted word, as a plain list of strings."""
+        rows = await self.backend.fetch_all(
+            'SELECT term FROM muted_terms ORDER BY term')
+        return [row['term'] for row in rows]
+
+    async def clear_mutes(self):
+        """Drop every mute — both products and terms. Returns the counts removed."""
+        products = await self.backend.execute('DELETE FROM muted_products')
+        terms = await self.backend.execute('DELETE FROM muted_terms')
+        return {'products': products, 'terms': terms}
+
+    # ── Bot 2: mirror deduplication ──
+    #
+    # Same shape and lifetime as matched_deals: a key, a timestamp, pruned after
+    # DEAL_RETENTION_DAYS. It exists so the same product posted by both tracked
+    # channels within minutes reaches you once, and it survives a restart, which an
+    # in-memory cache cannot.
+
+    async def is_mirror_seen(self, dedup_key, hours=None):
+        if not dedup_key:
+            return False
+        window = MIRROR_DEDUP_HOURS if hours is None else hours
+        cutoff = time.time() - (window * 3600)
+        row = await self.backend.fetch_one(
+            'SELECT dedup_key FROM mirror_seen WHERE dedup_key = ? AND seen_at > ?',
+            (dedup_key, cutoff)
+        )
+        return row is not None
+
+    async def mark_mirror_seen(self, dedup_key):
+        """Record that the mirror sent this. Refreshes the timestamp on a repeat."""
+        if not dedup_key:
+            return False
+        await self.backend.execute(
+            '''INSERT INTO mirror_seen (dedup_key, seen_at) VALUES (?, ?)
+               ON CONFLICT (dedup_key) DO UPDATE SET seen_at = excluded.seen_at''',
+            (dedup_key, time.time())
+        )
+        return True
+
+    async def cleanup_mirror_seen(self, days=None):
+        days = DEAL_RETENTION_DAYS if days is None else days
+        cutoff = time.time() - (days * 86400)
+        return await self.backend.execute(
+            'DELETE FROM mirror_seen WHERE seen_at < ?', (cutoff,))
+
     # ── Stats ──
 
     async def get_stats(self):
-        """Get bot statistics."""
-        # COUNT(*) is aliased because the implicit column name differs between
-        # engines ('COUNT(*)' in SQLite, 'count' in Postgres).
-        watchlist_count = (await self.backend.fetch_one(
-            'SELECT COUNT(*) AS cnt FROM watchlist'))['cnt']
-        active_channels = (await self.backend.fetch_one(
-            'SELECT COUNT(*) AS cnt FROM channels WHERE active = 1'))['cnt']
-        total_channels = (await self.backend.fetch_one(
-            'SELECT COUNT(*) AS cnt FROM channels'))['cnt']
-        deals_24h = (await self.backend.fetch_one(
-            'SELECT COUNT(*) AS cnt FROM matched_deals WHERE matched_date > ?',
-            (time.time() - 86400,)))['cnt']
-        total_deals = (await self.backend.fetch_one(
-            'SELECT COUNT(*) AS cnt FROM matched_deals'))['cnt']
+        """
+        Numbers for the status screen, each with its own error boundary.
 
-        return {
-            'watchlist_count': watchlist_count,
-            'active_channels': active_channels,
-            'total_channels': total_channels,
-            'deals_24h': deals_24h,
-            'total_deals': total_deals,
+        Every count is fetched independently and a failure is returned as None rather
+        than raised. The reason is a real debugging dead end this hit: one broken
+        query used to abort the whole screen, and because the send never happened the
+        symptom was a status command that did nothing at all. A count that reads None
+        renders as an explicit error next to the metric, so a missing table or a
+        sleeping database names itself instead of hiding behind a zero.
+
+        `backend` and `location` ride along for the same reason — a zero means
+        something very different depending on whether it came from Postgres or from a
+        SQLite file on a disk the host wipes on restart.
+        """
+        async def count(sql, params=()):
+            try:
+                # COUNT(*) is aliased because the implicit column name differs
+                # between engines ('COUNT(*)' in SQLite, 'count' in Postgres).
+                row = await self.backend.fetch_one(sql, params)
+                return row['cnt'] if row else 0
+            except Exception as e:
+                logger.error(f"Stats query failed [{sql.split('FROM')[-1].strip()}]: {e}")
+                return None
+
+        day_ago = time.time() - 86400
+        stats = {
+            'backend': self.backend.name,
+            'location': getattr(self.backend, 'location', '?'),
+            'watchlist_count': await count('SELECT COUNT(*) AS cnt FROM watchlist'),
+            'active_channels': await count(
+                'SELECT COUNT(*) AS cnt FROM channels WHERE active = 1'),
+            'total_channels': await count('SELECT COUNT(*) AS cnt FROM channels'),
+            'deals_24h': await count(
+                'SELECT COUNT(*) AS cnt FROM matched_deals WHERE matched_date > ?',
+                (day_ago,)),
+            'total_deals': await count('SELECT COUNT(*) AS cnt FROM matched_deals'),
+            'muted_products': await count('SELECT COUNT(*) AS cnt FROM muted_products'),
+            'muted_terms': await count('SELECT COUNT(*) AS cnt FROM muted_terms'),
+            'mirrored_24h': await count(
+                'SELECT COUNT(*) AS cnt FROM mirror_seen WHERE seen_at > ?', (day_ago,)),
         }
+
+        # Lifetime alert totals come from the counters, not from matched_deals — that
+        # table is a 7-day dedup ledger, so counting it understates a channel's real
+        # history the moment the first prune runs.
+        try:
+            row = await self.backend.fetch_one(
+                'SELECT COALESCE(SUM(alerts), 0) AS cnt FROM channel_stats')
+            stats['total_alerts'] = row['cnt'] if row else 0
+        except Exception as e:
+            logger.error(f"Stats query failed [channel_stats]: {e}")
+            stats['total_alerts'] = None
+
+        return stats
