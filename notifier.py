@@ -4,30 +4,24 @@ import logging
 import time
 from collections import OrderedDict
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
 from config import NOTIFIER_CACHE_SIZE, NOTIFIER_DEDUP_WINDOW
 from utils import format_price, format_time_ago, truncate
 
 logger = logging.getLogger(__name__)
 
 
-def feedback_keyboard(channel_id):
-    """
-    The 👍/👎 row attached to every alert.
-
-    The channel id rides in the callback data, which is what makes rating work
-    without storing anything about the alert: the vote is attributed to the channel
-    when the button is pressed, and the message itself is the only record that it was
-    ever offered. Telegram caps callback_data at 64 bytes — a channel id is ~14
-    digits, so this stays well inside it.
-    """
-    if channel_id is None:
-        return None
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton('👍 Good', callback_data=f'fb_u_{channel_id}'),
-        InlineKeyboardButton('👎 Junk', callback_data=f'fb_d_{channel_id}'),
-    ]])
+#
+# Bot 1's alerts carry no buttons.
+#
+# They used to have a 👍/👎 row for rating the channel an alert came from. That
+# gesture now lives on bot 2's mirror feed instead, where there is far more to judge:
+# bot 1 only ever sends what you already asked for by name, so rating it says little,
+# while the mirror shows everything and a 👎 there both mutes the product and counts
+# against the channel. See mirror.py.
+#
+# bot.py deliberately still handles the old `fb_*` callbacks, because alerts already
+# sitting in the chat keep their buttons forever and tapping one should not error.
+#
 
 
 class Notifier:
@@ -108,7 +102,6 @@ class Notifier:
                 text=message,
                 parse_mode='HTML',
                 disable_web_page_preview=False,
-                reply_markup=feedback_keyboard(deal_info.get('channel_id')),
             )
             logger.info(f"Deal alert sent: {deal_info.get('product_name', 'Unknown')}")
             return True
