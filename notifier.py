@@ -73,10 +73,17 @@ class Notifier:
         deal_url = deal_info.get('deal_url')
         keyword = deal_info.get('keyword', '')
         price = deal_info.get('price')
+        product_key = deal_info.get('product_key')
 
         # Create a unique footprint for this deal
-        if deal_url:
-            # If we have a direct link, that's the best fingerprint
+        if product_key:
+            # The product's own id — identical across channels and across affiliate
+            # tags, so this catches the near-simultaneous repost that the raw URL
+            # cannot. See product_key.py.
+            dedupe_key = f"pk:{product_key}"
+        elif deal_url:
+            # A direct link is the next best fingerprint, though two channels sharing
+            # one product usually rewrite it differently.
             dedupe_key = f"url:{deal_url}"
         elif price:
             # Otherwise, keyword + price is a strong indicator

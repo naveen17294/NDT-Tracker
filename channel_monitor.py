@@ -17,6 +17,7 @@ from telethon.tl.types import (
     WebPagePending,
 )
 
+import product_key as pkey
 from config import (
     API_HASH,
     API_ID,
@@ -27,8 +28,11 @@ from config import (
     PREVIEW_MAX_URLS,
     PREVIEW_RETRIES,
     PREVIEW_RETRY_DELAY,
+    RESOLVE_MAX_URLS,
+    RESOLVE_SHORT_LINKS,
     SESSION_NAME,
     SESSION_STRING,
+    URL_SHORTENERS,
     WATCHLIST_CACHE_TTL,
 )
 from database import Database
@@ -36,7 +40,7 @@ from keyword_matcher import KeywordMatcher
 from link_scraper import LinkScraper
 from notifier import Notifier
 from price_extractor import PriceExtractor
-from utils import clean_text, extract_urls, remove_emojis
+from utils import clean_text, extract_urls, format_price, remove_emojis
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,13 @@ class ChannelMonitor:
         self.notifier = Notifier(bot_instance)
         self.paused = False
         self._monitored_channel_ids = set()
+
+        # Bot 2. Set by bot.py after the mirror's Telegram connection is up, and left
+        # as None when BOT2_TOKEN is not configured — the monitor works either way and
+        # never waits on it. Mirroring runs as a detached task so its rate limiting
+        # cannot delay a watchlist alert.
+        self.mirror = None
+        self._mirror_tasks = set()
 
         # ── Bounded in-memory caches ──
         # Telegram preview lookups are network calls; deal channels repost the same
@@ -267,6 +278,58 @@ class ChannelMonitor:
         return title, desc
 
     # ══════════════════════════════════════
+    #  Product identity
+    # ══════════════════════════════════════
+
+    async def _product_keys(self, urls):
+        """
+        Canonical product keys for a message's URLs — the identity both bots dedup on.
+
+        Short links have to be followed first. 'amzn.to/3xYzAbC' carries no product
+        id, so two channels posting one deal under two affiliate tags look like two
+        deals until the redirect is resolved and both land on the same /dp/ASIN. That
+        redirect is one cached HTTP request per new short link, and a failure just
+        means this message falls back to text-based dedup.
+        """
+        if not urls:
+            return []
+
+        resolved = []
+        for url in urls[:RESOLVE_MAX_URLS]:
+            if RESOLVE_SHORT_LINKS and pkey.is_shortener(url, URL_SHORTENERS):
+                try:
+                    resolved.append(await self.scraper.resolve_final_url(url))
+                except Exception as e:
+                    logger.debug(f"Could not resolve {url}: {e}")
+                    resolved.append(url)
+            else:
+                resolved.append(url)
+
+        return pkey.keys_from_urls(resolved)
+
+    def _spawn_mirror(self, **kwargs):
+        """
+        Hand a post to bot 2 without making bot 1 wait for it.
+
+        The mirror throttles itself to stay inside Telegram's per-chat rate limit, so
+        awaiting it here would add up to a second of latency to every watchlist alert
+        and would serialise the two bots behind each other.
+        """
+        if self.mirror is None:
+            return
+        task = asyncio.create_task(self._mirror_one(**kwargs))
+        # Hold a reference: a task with no strong reference can be garbage collected
+        # mid-flight, and its exception disappears with it.
+        self._mirror_tasks.add(task)
+        task.add_done_callback(self._mirror_tasks.discard)
+
+    async def _mirror_one(self, **kwargs):
+        try:
+            await self.mirror.handle(**kwargs)
+        except Exception as e:
+            logger.exception(f"Mirror failed for a message: {e}")
+
+    # ══════════════════════════════════════
     #  Message handling
     # ══════════════════════════════════════
 
@@ -326,6 +389,24 @@ class ChannelMonitor:
 
         logger.info(f"📨 Scanning new message from tracked channel: {channel_name}")
 
+        urls = extract_urls(text)
+        product_keys = await self._product_keys(urls)
+        price_info = self.price_extractor.extract(text)
+
+        # ── Bot 2: the mirror gets EVERY post ──
+        # Ahead of the watchlist on purpose. Bot 2's job is the opposite of bot 1's:
+        # it sends everything except what you muted, so it must not be gated on a
+        # keyword matching, and it must still run when the watchlist is empty.
+        self._spawn_mirror(
+            text=text,
+            urls=urls,
+            channel_id=monitored_id,
+            channel_name=channel_name,
+            price_str=format_price(price_info['price']) if price_info['price'] else None,
+            preview_title=preview_title or None,
+            product_keys=product_keys,
+        )
+
         watchlist = await self._get_watchlist()
         if not watchlist:
             return
@@ -337,7 +418,6 @@ class ChannelMonitor:
         match_result = None
         match_source = 'text'
         product_name = ''
-        urls = extract_urls(text)
 
         # ── Step 1: message text (+ native preview) ──
         match_result = self.matcher.match(search_text, watchlist)
@@ -381,24 +461,25 @@ class ChannelMonitor:
         if not match_result:
             return
 
-        # ── Step 4: Extract price from message text ──
-        price_info = self.price_extractor.extract(text)
-
-        # ── Step 5: Deduplication ──
-        deal_hash = self._generate_deal_hash(product_name, price_info['price'], match_result['keyword'])
+        # ── Step 4: Deduplication ──
+        # price_info was extracted before the mirror ran, so it is already available.
+        deal_hash = self._generate_deal_hash(
+            product_name, price_info['price'], match_result['keyword'],
+            product_key=product_keys[0] if product_keys else None)
         if await self.db.is_deal_seen(deal_hash):
             logger.debug(f"Duplicate deal skipped: {match_result['keyword']}")
             return
 
-        # ── Step 6: Build message link ──
+        # ── Step 5: Build message link ──
         message_link = None
         if hasattr(event.message, 'id') and channel_username.startswith('@'):
             message_link = f"https://t.me/{channel_username[1:]}/{event.message.id}"
 
         deal_url = urls[0] if urls else None
 
-        # ── Step 7: Save and notify ──
+        # ── Step 6: Save and notify ──
         deal_info = {
+            'product_key': product_keys[0] if product_keys else None,
             'product_name': product_name,
             'keyword': match_result['keyword'],
             'matched_term': match_result['matched_term'],
@@ -441,9 +522,27 @@ class ChannelMonitor:
             f"Source={match_source} Channel={channel_username}"
         )
 
-    def _generate_deal_hash(self, product_name, price, keyword):
-        """Generate a hash for deduplication based on product and price."""
-        # Clean product name to remove slight variations
+    def _generate_deal_hash(self, product_name, price, keyword, product_key=None):
+        """
+        Identity for deduplication.
+
+        The product's own id wins whenever we have one, and the price and channel are
+        deliberately left out of it. This is what stops the duplicate you actually
+        see: both tracked channels post the same item within minutes, each with its
+        own affiliate link and its own marketing copy, so a hash built from the
+        message text differs every time and the same deal alerts twice. An ASIN does
+        not differ.
+
+        Price is excluded for the same reason — the two posts often quote it
+        differently (with and without a bank offer), and a deal is the same deal at
+        ₹2,899 or ₹2,999.
+
+        Only when no link could be canonicalised does this fall back to the old
+        name+price+keyword hash, which is the best available for a post whose product
+        we could not identify.
+        """
+        if product_key:
+            return hashlib.md5(f"pk:{product_key}|{keyword}".encode()).hexdigest()
         clean_name = re.sub(r'[^a-zA-Z0-9]', '', product_name.lower())[:50]
         content = f"{clean_name}|{price}|{keyword}"
         return hashlib.md5(content.encode()).hexdigest()
@@ -493,6 +592,14 @@ class ChannelMonitor:
 
     async def stop(self):
         """Stop the Telethon client and release its resources."""
+        # Detached mirror sends first — each one may be mid-sleep inside its rate
+        # limiter, and shutdown should not wait out the whole backlog.
+        for task in list(self._mirror_tasks):
+            task.cancel()
+        if self._mirror_tasks:
+            await asyncio.gather(*self._mirror_tasks, return_exceptions=True)
+        self._mirror_tasks.clear()
+
         try:
             await self.client.disconnect()
         except Exception as e:

@@ -22,6 +22,50 @@ def _env_int(name, default):
 # Telegram Bot Token (from @BotFather)
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
+# ── Bot 2: the channel mirror ──
+#
+# A SECOND bot, from a second @BotFather token, run by the same process off the same
+# Telethon connection and the same tracked channels. The split in responsibility:
+#
+#   bot 1  sends only what matches your watchlist  (a filter — signal you asked for)
+#   bot 2  sends everything EXCEPT what you muted  (a feed — everything else)
+#
+# Bot 2 exists because a Telegram channel is a bad shopping surface: no preview
+# cards, no way to see what a product actually is without opening every link. The
+# mirror re-sends each post into a private chat WITH the link preview left on, so the
+# product image, title and price render inline and you can judge it without tapping
+# through. That is the whole point, so MIRROR_PREVIEW is not configurable.
+#
+# Leave BOT2_TOKEN empty and the mirror simply never starts — bot 1 is untouched.
+# You must press Start on bot 2 once; Telegram forbids a bot messaging a user who has
+# never opened a chat with it.
+BOT2_TOKEN = os.getenv('BOT2_TOKEN', '')
+MIRROR_ENABLED = _env_bool('MIRROR_ENABLED', True)
+
+# Channel posts are marketing blasts; the mirror keeps the head of one and lets the
+# preview card carry the product detail.
+MIRROR_MAX_TEXT = _env_int('MIRROR_MAX_TEXT', 700)
+
+# Telegram tolerates about one message per second to a single chat before it starts
+# replying 429. Two busy deal channels can burst well past that, so the mirror
+# spaces its sends and drops nothing.
+MIRROR_SEND_INTERVAL = float(os.getenv('MIRROR_SEND_INTERVAL', '1.2'))
+
+# Cross-channel dedup for the mirror, in hours. Both tracked channels post the same
+# product within minutes of each other; this is what makes the second one silent.
+MIRROR_DEDUP_HOURS = _env_int('MIRROR_DEDUP_HOURS', 24)
+
+# Mirror only posts that carry at least one link. A text-only announcement has no
+# preview to render and nothing to open, which is the opposite of why bot 2 exists.
+MIRROR_REQUIRE_LINK = _env_bool('MIRROR_REQUIRE_LINK', True)
+
+# Follow short links (amzn.to, fkrt.it) to their destination before deriving a
+# product identity. This is what lets the same product posted by two channels under
+# two affiliate tags collapse into one alert — see product_key.py. One cached HTTP
+# request per new short link.
+RESOLVE_SHORT_LINKS = _env_bool('RESOLVE_SHORT_LINKS', True)
+RESOLVE_MAX_URLS = _env_int('RESOLVE_MAX_URLS', 2)
+
 # Telegram API credentials for User Client (Telethon)
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
