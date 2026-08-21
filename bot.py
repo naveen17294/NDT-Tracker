@@ -1007,6 +1007,17 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_view(update, await _render_stats())
 
 
+def _metric(value):
+    """
+    Render one count.
+
+    A metric that failed to load comes back as None from get_stats(), and saying so
+    matters: a zero and a broken query look identical on screen, and that ambiguity
+    is exactly what made "the statistics are empty" impossible to act on.
+    """
+    return '⚠️ error' if value is None else str(value)
+
+
 async def _render_stats():
     """HTML like every other view — see _reply_view."""
     stats = await db.get_stats()
@@ -1016,20 +1027,57 @@ async def _render_stats():
     link_str = "🟢 Connected" if (monitor and monitor.is_connected()) else "🔴 Disconnected"
     uptime = format_time_ago(time.time() - _started_at)
 
+    if mirror is None:
+        # Deliberately off and failed-to-start look identical on screen otherwise,
+        # and only one of them is a problem.
+        off_reason = _mirror_off_reason()
+        mirror_str = f'⚪ Off ({off_reason})' if off_reason else '🔴 Failed to start'
+    elif mirror.paused:
+        mirror_str = '⏸️ Paused'
+    else:
+        mirror_str = f'🟢 On · {mirror.sent} sent this run'
+
     msg = f"""📊 <b>NDT STATUS</b>
 
 <b>Status:</b> {status_str}
 🔌 <b>Telethon uplink:</b> {link_str}
+🪞 <b>Mirror (bot 2):</b> {mirror_str}
 ⏱️ <b>Uptime:</b> {uptime.replace(' ago', '')}
-🎯 <b>Tracked keywords:</b> {stats['watchlist_count']}
-📢 <b>Monitored channels:</b> {stats['active_channels']} / {stats['total_channels']}
-🔥 <b>Deals found (24h):</b> {stats['deals_24h']}
-📦 <b>Deals all-time:</b> {stats['total_deals']}"""
+
+🎯 <b>Tracked keywords:</b> {_metric(stats['watchlist_count'])}
+📢 <b>Monitored channels:</b> {_metric(stats['active_channels'])} / {_metric(stats['total_channels'])}
+🔥 <b>Deals found (24h):</b> {_metric(stats['deals_24h'])}
+📦 <b>Deals in dedup window:</b> {_metric(stats['total_deals'])}
+📣 <b>Alerts all-time:</b> {_metric(stats['total_alerts'])}
+🪞 <b>Mirrored (24h):</b> {_metric(stats['mirrored_24h'])}
+🔇 <b>Muted:</b> {_metric(stats['muted_products'])} products · {_metric(stats['muted_terms'])} words
+
+💾 <b>Storage:</b> {html.escape(stats['backend'])} — <code>{html.escape(str(stats['location']))}</code>"""
+
+    # An all-zero screen is almost always one of two things, and neither is obvious
+    # from a column of zeros. Say which, with the fix attached.
+    if stats['backend'] == 'sqlite':
+        msg += ("\n\n⚠️ <b>Storage is a local file.</b> If this host wipes its disk on "
+                "restart, the watchlist, channels and dedup ledger are lost every "
+                "time — which reads as empty statistics and returning duplicates. "
+                "Set <code>DATABASE_URL</code> to fix it permanently.")
+    elif not stats['watchlist_count'] and not stats['active_channels']:
+        msg += ("\n\n💡 Nothing is set up yet, so these counts are genuinely zero: "
+                "add a keyword with /watch and pick channels with /channels.")
+    elif not stats['watchlist_count']:
+        msg += "\n\n💡 No keywords yet — bot 1 can't match anything. Try /watch."
+    elif not stats['active_channels']:
+        msg += "\n\n💡 No channels tracked — nothing is being read. Try /channels."
+
+    # "Deals in dedup window" is not a lifetime total, and the old label ("all-time")
+    # claimed it was. matched_deals is pruned after DEAL_RETENTION_DAYS, so the
+    # number drops on its own; the lifetime figure is the counter above it.
     toggle = ('▶️ Resume', 'act_resume') if is_paused else ('⏸️ Pause', 'act_pause')
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(toggle[0], callback_data=toggle[1]),
          InlineKeyboardButton('📊 Channel report', callback_data='menu_report')],
-        [InlineKeyboardButton('« Menu', callback_data='menu_home')],
+        [InlineKeyboardButton('🔇 Muted list', callback_data='menu_muted'),
+         InlineKeyboardButton('« Menu', callback_data='menu_home')],
     ])
     return msg, markup
 
