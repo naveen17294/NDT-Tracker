@@ -289,7 +289,7 @@ class Database:
             '''INSERT INTO channel_stats (channel_id, alerts, last_alert_at)
                VALUES (?, 1, ?)
                ON CONFLICT (channel_id) DO UPDATE
-                   SET alerts = alerts + 1, last_alert_at = excluded.last_alert_at''',
+                   SET alerts = channel_stats.alerts + 1, last_alert_at = excluded.last_alert_at''',
             (channel_id, now)
         )
         return True
@@ -308,7 +308,7 @@ class Database:
         await self.backend.execute(
             f'''INSERT INTO channel_stats (channel_id, {column})
                 VALUES (?, 1)
-                ON CONFLICT (channel_id) DO UPDATE SET {column} = {column} + 1''',
+                ON CONFLICT (channel_id) DO UPDATE SET {column} = channel_stats.{column} + 1''',
             (channel_id,)
         )
         return True

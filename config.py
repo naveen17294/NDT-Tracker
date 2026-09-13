@@ -128,7 +128,7 @@ DISCOUNT_PATTERN = r'(\d{1,2})%\s*(?:off|discount|saving)'
 # Telegram's own servers render the preview, so they have already cleared Amazon's
 # and Flipkart's anti-bot walls for us. This path is tried BEFORE any HTTP scraping.
 PREVIEW_MAX_URLS = _env_int('PREVIEW_MAX_URLS', 2)      # URLs to ask Telegram about per message
-PREVIEW_RETRIES = _env_int('PREVIEW_RETRIES', 4)        # WebPagePending re-polls before giving up
+PREVIEW_RETRIES = _env_int('PREVIEW_RETRIES', 6)        # WebPagePending re-polls before giving up
 PREVIEW_RETRY_DELAY = float(os.getenv('PREVIEW_RETRY_DELAY', '1.5'))  # seconds between re-polls
 PREVIEW_CACHE_SIZE = _env_int('PREVIEW_CACHE_SIZE', 300)
 PREVIEW_CACHE_TTL = _env_int('PREVIEW_CACHE_TTL', 900)  # 15 minutes
@@ -136,7 +136,7 @@ PREVIEW_CACHE_TTL = _env_int('PREVIEW_CACHE_TTL', 900)  # 15 minutes
 # ── Link Scraper Settings (LAST-RESORT fallback only) ──
 # Set ENABLE_HTML_SCRAPER=false to disable outbound HTTP scraping entirely and rely
 # purely on Telegram previews (lowest memory, no CAPTCHA risk).
-ENABLE_HTML_SCRAPER = _env_bool('ENABLE_HTML_SCRAPER', True)
+ENABLE_HTML_SCRAPER = _env_bool('ENABLE_HTML_SCRAPER', False)
 SCRAPE_TIMEOUT = _env_int('SCRAPE_TIMEOUT', 5)          # seconds per URL
 SCRAPE_CACHE_TTL = _env_int('SCRAPE_CACHE_TTL', 600)    # 10 minutes cache
 SCRAPE_CACHE_SIZE = _env_int('SCRAPE_CACHE_SIZE', 200)  # hard entry cap (LRU eviction)
