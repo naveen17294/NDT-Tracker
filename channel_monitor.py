@@ -91,9 +91,19 @@ class ChannelMonitor:
         # affiliate link constantly, so cache resolved previews. OrderedDict + explicit
         # cap gives us true LRU eviction instead of a dict that only ever grows.
         self._preview_cache = OrderedDict()  # url -> (title, description, timestamp)
+        # Product keys derived from Telegram's resolved WebPage.url (not the original
+        # short link). Lets us dedup even when the redirect resolution HTTP call fails.
+        self._preview_key_cache = {}         # original_short_url -> product_key string
         # The watchlist was previously re-read from SQLite on every single message.
         self._watchlist_cache = None
         self._watchlist_cache_at = 0.0
+
+        # ── Per-deal async locks (Fix: TOCTOU race condition) ──
+        # Two channels posting the same deal within ~1 second spawn two concurrent
+        # asyncio tasks. Without a lock, both call is_deal_seen() before either saves,
+        # both see False, and both alert. The lock makes check+save atomic per hash.
+        self._deal_locks: dict = {}
+        self._deal_locks_guard = asyncio.Lock()  # protects the dict itself
 
     async def start(self):
         """Start the Telethon client and register event handlers."""
@@ -187,6 +197,23 @@ class ChannelMonitor:
         while len(self._preview_cache) > PREVIEW_CACHE_SIZE:
             self._preview_cache.popitem(last=False)  # evict least-recently-used
 
+    async def _get_deal_lock(self, deal_hash):
+        """
+        Return an asyncio.Lock unique to this deal hash.
+
+        Two messages from different channels posting the same product arrive within
+        milliseconds of each other. Both tasks call is_deal_seen() before either has
+        saved — both see False, both alert. Locking on the hash makes the
+        check + save block atomic per product, eliminating the race entirely.
+
+        Locks are never removed — in practice there are at most a few hundred unique
+        deals per day on a free tier, so memory is not a concern.
+        """
+        async with self._deal_locks_guard:
+            if deal_hash not in self._deal_locks:
+                self._deal_locks[deal_hash] = asyncio.Lock()
+            return self._deal_locks[deal_hash]
+
     @staticmethod
     def _unwrap_media(result):
         """
@@ -239,6 +266,17 @@ class ChannelMonitor:
                 desc = (getattr(webpage, 'description', '') or '').strip()
                 if title or desc:
                     self._cache_put(url, title, desc)
+                    # Extract a canonical product key from the URL Telegram resolved to.
+                    # Telegram follows the short link for us and puts the final URL in
+                    # webpage.url — so even when our own HTTP redirect resolution fails,
+                    # we can still derive amazon:ASIN / flipkart:pid here and use it
+                    # as the dedup identity instead of falling back to a text hash.
+                    resolved_url = (getattr(webpage, 'url', '') or '').strip()
+                    if resolved_url and resolved_url != url:
+                        keys = pkey.keys_from_urls([resolved_url])
+                        if keys:
+                            self._preview_key_cache[url] = keys[0]
+                            logger.debug(f"Preview key cached for {url}: {keys[0]}")
                     logger.info(f"✅ Telegram preview resolved (attempt {attempt}): '{title[:70]}'")
                     return title, desc
                 logger.debug(f"Preview for {url} had no title/description")
@@ -305,7 +343,21 @@ class ChannelMonitor:
             else:
                 resolved.append(url)
 
-        return pkey.keys_from_urls(resolved)
+        keys = pkey.keys_from_urls(resolved)
+
+        # Fallback: if HTTP redirect resolution failed to yield an ASIN/pid,
+        # check the preview key cache populated by _resolve_preview. Telegram's
+        # servers followed the short link for us when rendering the preview and
+        # put the final product URL in WebPage.url — we extract the key there.
+        if not keys:
+            for url in urls[:RESOLVE_MAX_URLS]:
+                cached_key = self._preview_key_cache.get(url)
+                if cached_key:
+                    logger.debug(f"Using preview-derived product key for {url}: {cached_key}")
+                    keys = [cached_key]
+                    break
+
+        return keys
 
     def _spawn_mirror(self, **kwargs):
         """
@@ -461,55 +513,61 @@ class ChannelMonitor:
         if not match_result:
             return
 
-        # ── Step 4: Deduplication ──
-        # price_info was extracted before the mirror ran, so it is already available.
+        # ── Step 4: Deduplication (atomic check + save via per-deal lock) ──
+        # Without the lock: two channels posting the same deal within ~1 second spawn
+        # two concurrent tasks. Both call is_deal_seen() before either saves — both
+        # see False — both alert. The lock makes check+save atomic per deal hash.
         deal_hash = self._generate_deal_hash(
             product_name, price_info['price'], match_result['keyword'],
             product_key=product_keys[0] if product_keys else None)
-        if await self.db.is_deal_seen(deal_hash):
-            logger.debug(f"Duplicate deal skipped: {match_result['keyword']}")
-            return
 
-        # ── Step 5: Build message link ──
-        message_link = None
-        if hasattr(event.message, 'id') and channel_username.startswith('@'):
-            message_link = f"https://t.me/{channel_username[1:]}/{event.message.id}"
+        deal_lock = await self._get_deal_lock(deal_hash)
+        async with deal_lock:
+            if await self.db.is_deal_seen(deal_hash):
+                logger.debug(f"Duplicate deal skipped: {match_result['keyword']}")
+                return
 
-        deal_url = urls[0] if urls else None
+            # ── Step 5: Build message link ──
+            message_link = None
+            if hasattr(event.message, 'id') and channel_username.startswith('@'):
+                message_link = f"https://t.me/{channel_username[1:]}/{event.message.id}"
 
-        # ── Step 6: Save and notify ──
-        deal_info = {
-            'product_key': product_keys[0] if product_keys else None,
-            'product_name': product_name,
-            'keyword': match_result['keyword'],
-            'matched_term': match_result['matched_term'],
-            'confidence': match_result['confidence'],
-            'match_type': match_result['match_type'],
-            'match_source': match_source,
-            'price': price_info['price'],
-            'original_price': price_info['original_price'],
-            'discount': price_info['discount'],
-            'channel_name': channel_username,
-            'channel_id': monitored_id,
-            'message_link': message_link,
-            'deal_url': deal_url,
-            'timestamp': time.time(),
-            'raw_text': text,
-        }
+            deal_url = urls[0] if urls else None
 
-        # Save to database
-        await self.db.save_deal(
-            deal_hash=deal_hash,
-            keyword_matched=match_result['keyword'],
-            product_name=product_name,
-            price=str(price_info['price']) if price_info['price'] else '',
-            channel_name=channel_username,
-            message_link=message_link or '',
-        )
+            # ── Step 6: Save and notify ──
+            deal_info = {
+                'product_key': product_keys[0] if product_keys else None,
+                'product_name': product_name,
+                'keyword': match_result['keyword'],
+                'matched_term': match_result['matched_term'],
+                'confidence': match_result['confidence'],
+                'match_type': match_result['match_type'],
+                'match_source': match_source,
+                'price': price_info['price'],
+                'original_price': price_info['original_price'],
+                'discount': price_info['discount'],
+                'channel_name': channel_username,
+                'channel_id': monitored_id,
+                'message_link': message_link,
+                'deal_url': deal_url,
+                'timestamp': time.time(),
+                'raw_text': text,
+            }
 
-        # Send notification. Only count it against the channel if it actually went
-        # out — the notifier drops in-window duplicates, and those would otherwise
-        # inflate a channel's alert total without you ever seeing them.
+            # Save INSIDE the lock so the next task entering after us will see the
+            # row and bail out at is_deal_seen() above.
+            await self.db.save_deal(
+                deal_hash=deal_hash,
+                keyword_matched=match_result['keyword'],
+                product_name=product_name,
+                price=str(price_info['price']) if price_info['price'] else '',
+                channel_name=channel_username,
+                message_link=message_link or '',
+            )
+
+        # Send notification outside the lock — Telegram I/O can take 100-500ms and
+        # there is no race to protect here once the row is committed.
+        # Only count it against the channel if the alert actually went out.
         sent = await self.notifier.send_deal_alert(OWNER_ID, deal_info)
         if sent:
             try:
@@ -542,7 +600,11 @@ class ChannelMonitor:
         we could not identify.
         """
         if product_key:
-            return hashlib.md5(f"pk:{product_key}|{keyword}".encode()).hexdigest()
+            # Keyword intentionally excluded: the same product is the same deal
+            # regardless of which watchlist keyword matched it. Including keyword here
+            # caused one product to generate N hashes for N matching keywords —
+            # e.g., Galaxy Buds matching both "buds" and "earphones" fired two alerts.
+            return hashlib.md5(f"pk:{product_key}".encode()).hexdigest()
         clean_name = re.sub(r'[^a-zA-Z0-9]', '', product_name.lower())[:50]
         content = f"{clean_name}|{price}|{keyword}"
         return hashlib.md5(content.encode()).hexdigest()
